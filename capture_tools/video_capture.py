@@ -21,6 +21,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 from config import SCREENSHOT_DIR,CAPTURE_ROOT
 from utils.file_utils import exist_path,date_path,now_file_name
+from utils.logger import Enable_Logger
 
 _C_g_cap_key = 'p' #用于终止录制的按键
 _C_g_cap_func_key = 'alt' #用于终止录制的控制按键
@@ -44,7 +45,7 @@ def terminate_capture_check(key):
         if any(ctrl in _g_current_keys for ctrl in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
 
-            print(f"Detected Ctrl + {_C_g_cap_key} combination!")
+            # print(f"Detected Ctrl + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -53,7 +54,7 @@ def terminate_capture_check(key):
         if any(alt in _g_current_keys for alt in [keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
 
-            print(f"Detected Alt + {_C_g_cap_key} combination!")
+            # print(f"Detected Alt + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -71,16 +72,24 @@ def terminate_capture_release(key):
         pass
 
 def gaming_key_press(key):
+    '''
+    key     : 0
+    press   : 0
+    '''
     try:
-        line = f"key,press,{key},{_g_frame_count}\n"
+        line = f"0,0,{key},{_g_frame_count}\n"
     except AttributeError:
-        line = f"key,press,{str(key)},{_g_frame_count}\n"
+        line = f"0,0,{str(key)},{_g_frame_count}\n"
 
     with _key_press_lock:
         _g_key_press_events.append(line)
 
 
 def gaming_key_release(key):
+    '''
+    key     : 0
+    release : 1
+    '''
     line = f"key,release,{str(key)},{_g_frame_count}\n"
 
     with _key_release_lock:
@@ -88,7 +97,11 @@ def gaming_key_release(key):
 
 
 def gaming_mouse_move(x, y):
-    line = f"mouse,move,{str(x)},{str(y)},{_g_frame_count}\n"
+    '''
+    mouse   : 1
+    move    : 0
+    '''
+    line = f"1,0,{str(x)},{str(y)},{_g_frame_count}\n"
 
     with _mouse_move_lock:
         _g_mouse_move_events.append(line)
@@ -96,7 +109,11 @@ def gaming_mouse_move(x, y):
 
 
 def gaming_mouse_click(x, y, button, pressed):
-    line = f"mouse,click,{str(x)},{str(y)},{str(button)},{str(pressed)},{_g_frame_count}\n"
+    '''
+    mouse   : 1
+    click   : 1
+    '''
+    line = f"1,1,{str(x)},{str(y)},{str(button)},{str(pressed)},{_g_frame_count}\n"
 
     with _mouse_click_lock:
         _g_mouse_click_events.append(line)
@@ -124,7 +141,7 @@ def capture_screen(**kwargs):
     if("fps" in kwargs):
         fps = kwargs["fps"]
     else:
-        fps = 10.0
+        fps = 20.0
 
     if("debug" in kwargs):
         global _g_debug_flag
@@ -219,5 +236,6 @@ def run():
     pass
 
 if __name__ == "__main__":
+    Enable_Logger()
     run()
     pass
