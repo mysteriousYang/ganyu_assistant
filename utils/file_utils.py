@@ -14,7 +14,7 @@ def date_path():
     now = datetime.datetime.now()
     return f"{now.year}-{now.month:02d}-{now.day:02d}"
 
-def now_file_name(file_ext:str)->str:
+def now_file_name(file_ext:str="")->str:
     formatted_time = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S-%f")
     return f"{formatted_time}.{file_ext}"
 
