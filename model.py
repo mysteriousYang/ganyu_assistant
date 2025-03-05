@@ -7,6 +7,31 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 
+class CNNRNN_for_moving(nn.Module):
+    def __init__(self, num_classes):
+        super(CNNRNN_for_moving, self).__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        self.rnn = nn.LSTM(64 * 8 * 8, 128, batch_first=True)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        batch_size, seq_len, C, H, W = x.size()
+        x = x.view(batch_size * seq_len, C, H, W)
+        x = self.cnn(x)
+        x = x.view(batch_size, seq_len, -1)
+        x, _ = self.rnn(x)
+        x = self.fc(x[:, -1, :])
+        return x
+
+
+
 class DQN(nn.Module):
     def __init__(self, input_shape, num_actions):
         super(DQN, self).__init__()

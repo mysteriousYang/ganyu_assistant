@@ -21,7 +21,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 from config import SCREENSHOT_DIR,CAPTURE_ROOT
 from utils.file_utils import exist_path,date_path,now_file_name
-from utils.logger import Enable_Logger
+from utils.logger import Enable_Console_Logger,get_stream_logger
 
 _C_g_cap_key = 'p' #用于终止录制的按键
 _C_g_cap_func_key = 'alt' #用于终止录制的控制按键
@@ -30,22 +30,25 @@ _g_key_press_events = []
 _g_key_release_events = []
 _g_mouse_move_events = []
 _g_mouse_click_events = []
+_g_mouse_scroll_events = []
 _g_frame_count = 1
-_g_debug_flag = False
+# _g_debug_flag = False
 
 _key_press_lock = threading.Lock()
 _key_release_lock = threading.Lock()
 _mouse_move_lock = threading.Lock()
 _mouse_click_lock = threading.Lock()
+_mouse_scroll_lock = threading.Lock()
+
+_logger = get_stream_logger()
 
 def terminate_capture_check(key):
-    if(_g_debug_flag):
-        print(_g_current_keys)
+    # _logger.debug(_g_current_keys)
     if(_C_g_cap_func_key == "ctrl"):
         if any(ctrl in _g_current_keys for ctrl in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
 
-            # print(f"Detected Ctrl + {_C_g_cap_key} combination!")
+            _logger.debug(f"Detected Ctrl + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -54,7 +57,7 @@ def terminate_capture_check(key):
         if any(alt in _g_current_keys for alt in [keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
 
-            # print(f"Detected Alt + {_C_g_cap_key} combination!")
+            _logger.debug(f"Detected Alt + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -77,9 +80,9 @@ def gaming_key_press(key):
     press   : 0
     '''
     try:
-        line = f"0,0,{key},{_g_frame_count}\n"
+        line = f"0,0,{key.char.lower()},{_g_frame_count}\n"
     except AttributeError:
-        line = f"0,0,{str(key)},{_g_frame_count}\n"
+        line = f"0,0,{key.name},{_g_frame_count}\n"
 
     with _key_press_lock:
         _g_key_press_events.append(line)
@@ -90,7 +93,10 @@ def gaming_key_release(key):
     key     : 0
     release : 1
     '''
-    line = f"key,release,{str(key)},{_g_frame_count}\n"
+    try:
+        line = f"0,1,{key.char.lower()},{_g_frame_count}\n"
+    except AttributeError:
+        line = f"0,1,{key.name},{_g_frame_count}\n"
 
     with _key_release_lock:
         _g_key_release_events.append(line)
@@ -119,6 +125,16 @@ def gaming_mouse_click(x, y, button, pressed):
         _g_mouse_click_events.append(line)
 
 
+def gaming_mouse_scroll(x, y, dx, dy):
+    '''
+    mouse   : 1
+    scroll  : 2
+    '''
+    line = f"1,2,{str(x)},{str(y)},{str(dx)},{str(dy)},{_g_frame_count}\n"
+
+    with _mouse_scroll_lock:
+        _g_mouse_scroll_events.append(line)
+
 def capture_screen(**kwargs):
     '''
     需要提供的字段: \n
@@ -143,9 +159,9 @@ def capture_screen(**kwargs):
     else:
         fps = 20.0
 
-    if("debug" in kwargs):
-        global _g_debug_flag
-        _g_debug_flag = True
+    # if("debug" in kwargs):
+    #     global _g_debug_flag
+    #     _g_debug_flag = True
 
     # 设置录制区域
     monitor = {"top": 0, "left": 0, "width": 1920, "height": 1080}  # 录制整个屏幕
@@ -158,14 +174,15 @@ def capture_screen(**kwargs):
     out = cv2.VideoWriter(output_video, fourcc, fps, (monitor["width"], monitor["height"]))
 
     # 录制屏幕
+    # print(f"开始录像... 按下 {_C_g_cap_func_key} + {_C_g_cap_key} 停止录像")
     print(f"开始录像... 按下 {_C_g_cap_func_key} + {_C_g_cap_key} 停止录像")
 
     # 启动键鼠监听器
     key_listener = keyboard.Listener(
-        on_press=gaming_key_press,on_release=gaming_key_release
+        on_press=gaming_key_press,on_release=gaming_key_release,
     )
     mouse_listener = mouse.Listener(
-        on_move=gaming_mouse_move,on_click=gaming_mouse_click
+        on_move=gaming_mouse_move,on_click=gaming_mouse_click,on_scroll=gaming_mouse_scroll
     )
     key_listener.start()
     mouse_listener.start()
@@ -192,12 +209,21 @@ def capture_screen(**kwargs):
             # 每10帧存储一次
             if(_g_frame_count % 10 == 0):
                 with open(output_csv,mode="a",encoding="utf-8") as fout:
+                    
+                    if not _g_key_press_events.__len__() == 0:
+                        _logger.debug(_g_key_press_events)
 
-                    if(_g_debug_flag):
-                        print(_g_key_press_events)
-                        print(_g_key_release_events)
-                        print(_g_mouse_move_events)
-                        print(_g_mouse_click_events)
+                    if not _g_key_release_events.__len__() == 0:
+                        _logger.debug(_g_key_release_events)
+
+                    if not _g_mouse_move_events.__len__() == 0:
+                        _logger.debug(_g_mouse_move_events)
+
+                    if not _g_mouse_click_events.__len__() == 0:
+                        _logger.debug(_g_mouse_click_events)
+
+                    if not _g_mouse_scroll_events.__len__() == 0:
+                        _logger.debug(_g_mouse_scroll_events)
 
 
                     with _key_press_lock:
@@ -220,22 +246,28 @@ def capture_screen(**kwargs):
                             fout.write(line)
                         _g_mouse_click_events.clear()
 
+                    with _mouse_scroll_lock:
+                        for line in _g_mouse_scroll_events:
+                            fout.write(line)
+                        _g_mouse_scroll_events.clear()
+
 
     # 释放资源
     out.release()
     key_listener.stop()
     mouse_listener.stop()
     cv2.destroyAllWindows()
-    print("录像已保存: ", output_video)
+
+    _logger.info(f"录像已保存: {output_video}")
 
 def run():
     path = exist_path(CAPTURE_ROOT, date_path())
-    print(f"录制路径: {path}")
+    _logger.info(f"录制路径: {path}")
 
     capture_screen(save_path=path,debug=True)
     pass
 
 if __name__ == "__main__":
-    Enable_Logger()
+
     run()
     pass
