@@ -4,9 +4,12 @@ import json
 import logging
 import cv2
 import torch.nn
+import argparse
 
 import numpy as np
 
+from RAFT.raft import RAFT
+from RAFT.utils import flow_viz
 from torch.utils.data import Dataset
 from moviepy.editor import VideoFileClip
 from pathlib import Path
@@ -14,8 +17,64 @@ from utils.logger import get_stream_logger,timer_logger
 
 _logger = get_stream_logger()
 
+class Control_Record():
+    def __init__(self,
+                 record_path,
+                 record):
+        self.record_path = record_path
+        self.record = record
+        self.clip_in_ram = False
+
+        self.raw_clip_file = os.path.join(self.record_path,f"{self.record}.mp4")
+        self.raw_clip_file_S = os.path.join(self.record_path,f"{self.record}_s.mp4")
+        self.flow_clip_file = os.path.join(self.record_path,f"{self.record}_flow.mp4")
+        self.flow_clip_file_S = os.path.join(self.record_path,f"{self.record}_s_flow.mp4")
+        self.kb_file = os.path.join(self.record_path,f"{self.record}.kb")
+        self.ms_file = os.path.join(self.record_path,f"{self.record}.ms")
+
+        # 读取视频信息
+        with open(os.path.join(self.record_path,f"{self.record}_info.json")) as json_in:
+            self.info = json.load(json_in)
+
+        self.kb_event = list()
+        self.ms_event = list()
+
+        pass
+
+    def load_control_seq(self):
+        # keyboard
+        with open(self.kb_file,mode='r',encoding="utf-8") as fp:
+            while True:
+                line = fp.read()
+                if(line == ''):break
+                self.kb_event.append(line.strip().split(','))
+        
+        # mouse
+        with open(self.ms_file,mode='r',encoding="utf-8") as fp:
+            while True:
+                line = fp.read()
+                if(line == ''):break
+                self.ms_event.append(line.strip().split(','))
+
+    def get_block(idx):
+        pass
+
+    def init_mem_queue():
+        pass
+
+    def load_clip_from_disk(self):
+        if(self.clip_in_ram):
+            return
+        
+        # load 
+        pass
+
+
 class Genshin_Basic_Control_Dataset(Dataset):
-    def __init__(self,record_path):
+    def __init__(self,
+                 record_path,
+
+                 ):
         '''
         初始化用于训练动作控制模型的数据集
         
@@ -24,7 +83,8 @@ class Genshin_Basic_Control_Dataset(Dataset):
         '''
 
         self.capture_dir = os.path.dirname(record_path)
-
+        self.mouse_data = dict()
+        self.keyboard_data = dict()
     
 
 
@@ -40,6 +100,8 @@ class Genshin_Basic_Control_Dataset(Dataset):
         :param index: 索引
         """
         pass
+
+    
 
 
 def process_raw_csv(path:str,record:str,**kwargs):
@@ -178,6 +240,11 @@ def clip_compression(path:str,record:str,**kwargs):
     # 加载视频
     video = VideoFileClip(os.path.join(path,input_video))
 
+    # 读取信息
+    total_frames = int(video.fps * video.duration)
+    original_fps = video.fps
+    original_width, original_height = video.size
+
     _logger.info(f"正在压制 {input_video}")
     _logger.info(f"目标大小: {new_width}*{new_height}")
 
@@ -193,6 +260,18 @@ def clip_compression(path:str,record:str,**kwargs):
     # 关闭视频对象
     video.close()
     resized_video.close()
+
+    # 存储原始属性
+    with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+        video_info = dict()
+        video_info["original_fps"] = original_fps
+        video_info["original_width"] = original_width
+        video_info["original_height"] = original_height
+        video_info["total_frames"] = total_frames
+        video_info["flag_raw"] = True
+        video_info["flag_raw_S"] = True
+        json.dump(video_info,fp)
+        _logger.info(f"视频信息已存储 {input_video}")
 
 
 # OpenCV版本的视频压制代码
@@ -241,6 +320,8 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     original_fps = cap.get(cv2.CAP_PROP_FPS)
     original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
 
     # 设置输出视频的编码器和属性
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MP4编码器
@@ -277,6 +358,18 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     out.release()
     _logger.info(f"压制完成 {output_video}")
 
+    # 存储原始属性
+    with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+        video_info = dict()
+        video_info["original_fps"] = original_fps
+        video_info["original_width"] = original_width
+        video_info["original_height"] = original_height
+        video_info["total_frames"] = total_frames
+        video_info["flag_raw"] = True
+        video_info["flag_raw_S"] = True
+        json.dump(video_info,fp)
+        _logger.info(f"视频信息已存储 {input_video}")
+
 
 @timer_logger
 def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwargs):
@@ -291,6 +384,7 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         cuda_available = True
 
     if use_large:
+        _logger.warning("警告: 正在使用原视频计算光流")
         input_video = f"{record}.mp4"
         output_video = f"{record}_flow.mp4"
     else:
@@ -429,22 +523,29 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         out.release()
         cv2.destroyAllWindows()
 
+    with open(os.path.join(record_dir,f"{record}_info.json"),mode='w+',encoding="utf-8") as fp:
+        info = json.load(fp)
+        if(use_large):
+            info["flag_flow"] = True
+        else:
+            info["flag_flow_S"] = True
+        json.dump(info,fp)
+        _logger.info(f"视频信息已存储 {input_video}")
+
+# 加载 RAFT 模型
+def load_raft_model(args):
+    model = RAFT(args)
+    model = torch.nn.DataParallel(model)
+    model.load_state_dict(torch.load(args.path))
+    model.to('cuda')
+    model.eval()
+    return model
 
 @timer_logger
 def calculate_opticcal_flow_torch(record_dir:str,record:str):
-    import argparse
-    from RAFT.raft import RAFT
-    from RAFT.utils import flow_viz
-    from RAFT.utils.utils import InputPadder
-
-    # 加载 RAFT 模型
-    def load_raft_model(args):
-        model = RAFT(args)
-        model = torch.nn.DataParallel(model)
-        model.load_state_dict(torch.load(args.path))
-        model.to('cuda')
-        model.eval()
-        return model
+    '''
+    使用RAFT计算视频光流(不推荐)
+    '''
 
     # 初始化模型
     args = argparse.Namespace(
@@ -514,6 +615,7 @@ def calculate_opticcal_flow_torch(record_dir:str,record:str):
 
     _logger.info(f"光流视频已保存到: {output_path}")
 
+
 def transfer_capture_dir(dir:str):
     '''
     将某个文件夹下的所有录像转化为数据集
@@ -532,8 +634,16 @@ def transfer_capture_dir(dir:str):
         process_raw_csv(path=dir, record=csv_file.stem)
         # clip_compression(path=dir, record=csv_file.stem)
         clip_compression_opencv(path=dir,record=csv_file.stem)
-        calculate_optical_flow(record_dir=dir,record=csv_file.stem,use_large=True)
+        calculate_optical_flow(record_dir=dir,record=csv_file.stem,)
         # calculate_opticcal_flow_torch(record_dir=dir,record=csv_file.stem)
+
+    records = list()
+    with open(os.path.join(dir,"records.txt"),mode='r',encoding="utf-8") as fp:
+        records = fp.readlines()
+
+    # 读取每个record，并把帧信息存入Dataset
+    for i,record in enumerate(records):
+        record = record.strip()
 
 
 if __name__ == "__main__":
