@@ -5,7 +5,7 @@ import sys
 import logging
 import datetime
 
-LOG_FILE = ".\\logs\\" + datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + ".log"
+LOG_FILE = ".\\logs\\" + datetime.datetime.now().strftime('%Y-%m-%d') + '\\' + datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + ".log"
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
@@ -43,6 +43,7 @@ def timer_logger(func):
     return wrapper
 
 def get_stream_logger():
+    exist_path(f".\\logs\\{datetime.datetime.now().strftime('%Y-%m-%d')}")
     # 创建日志处理器
     console_handler = logging.StreamHandler(sys.stdout)
     file_handler = logging.FileHandler(LOG_FILE)

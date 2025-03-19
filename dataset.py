@@ -2,12 +2,17 @@
 import os
 import json
 import logging
+import math
 import cv2
 import torch.nn
 import argparse
+import queue
+import gc
+import subprocess
 
 import numpy as np
 
+from typing import List
 from RAFT.raft import RAFT
 from RAFT.utils import flow_viz
 from torch.utils.data import Dataset
@@ -18,6 +23,10 @@ from utils.logger import get_stream_logger,timer_logger
 _logger = get_stream_logger()
 
 class Control_Record():
+    '''
+    描述控制录像的类
+
+    '''
     def __init__(self,
                  record_path,
                  record):
@@ -35,74 +44,529 @@ class Control_Record():
         # 读取视频信息
         with open(os.path.join(self.record_path,f"{self.record}_info.json")) as json_in:
             self.info = json.load(json_in)
+            _logger.debug(f"{self.record}: 成功读取录像信息")
 
-        self.kb_event = list()
-        self.ms_event = list()
+        self.video_obj = None
 
-        pass
+        self.make_control_seq()
+        _logger.debug(f"{self.record}: 对象构造完成 {repr(self)}")
 
-    def load_control_seq(self):
-        # keyboard
+    def _fill_key_press_status(self, press_frames, release_frames):
+        """
+        将按键按下与释放之间的所有帧标记为“按键按下”。
+        
+        参数:
+            press_frames (list): 按键按下的帧号列表。
+            release_frames (list): 按键释放的帧号列表。
+            total_frames (int): 视频的总帧数。
+        
+        返回:
+            key_status (np.array): 形状为(total_frames,)，表示每一帧的按键状态。
+        """
+        # 初始化全零数组
+        key_status = np.zeros(self.info["total_frames"], dtype=np.uint16)
+        
+        # 遍历按下与释放的帧对
+        for press, release in zip(press_frames, release_frames):
+            if press < release:
+                key_status[press:release + 1] = 1  # 按下到释放之间的帧标记为1
+            else:
+                _logger.warning(f"{repr(self)}: 警告：按下帧 {press} 大于释放帧 {release}，跳过该对")
+        
+        return key_status
+
+    def fill_key_press(self):
+        """
+        将按键按下与释放之间的所有帧标记为“按键按下”。
+        
+        参数:
+        
+        返回:
+            key_status (np.array): 形状为(total_frames,)，表示每一帧的按键状态。
+
+        控制操作需要的按键:
+            W       12
+            S       22
+            A       21
+            D       23
+            shift   100
+            ctrl    101
+            space   109
+            X       31
+            共7个键
+        """
+
+        # 初始化全零数组
+        key_status = np.zeros((self.info["total_frames"],7), dtype=np.uint16)
+        key_events = {
+            # ( [press], [release] )
+            "12":([],[]),    # W
+            "22":([],[]),    # S
+            "21":([],[]),    # A
+            "23":([],[]),    # D
+            "100":([],[]),   # shift
+            "101":([],[]),   # ctrl
+            "109":([],[]),   # space
+            "31":([],[]),    # X
+        }
+
+        _logger.debug(f"{self.record}: 正在填充按键数据")
         with open(self.kb_file,mode='r',encoding="utf-8") as fp:
             while True:
-                line = fp.read()
+                # 字段结构
+                # 状态（0为按下，1为松开） |  按键编号  |  帧编号
+                line = fp.readline()
                 if(line == ''):break
-                self.kb_event.append(line.strip().split(','))
+                # print(line.strip().split('\t'))
+                status,key,frame_num = line.strip().split('\t')
+
+                # 只处理需要统计的按键
+                if(key in key_events):
+                    if(status == '0'):
+                        key_events[key][0].append(int(frame_num))
+                    elif(status == '1'):
+                        key_events[key][1].append(int(frame_num))
+
+        for i, (key, (press_frames, release_frames)) in enumerate(key_events.items()):
+            # 注意i是从1开始
+            key_status[:, i - 1] = self._fill_key_press_status(press_frames, release_frames)
+    
+        return key_status
+
+    def make_control_seq(self,block_size=100):
+
+        self.BLOCK_SIZE = block_size
+        self.kb_event = self.fill_key_press()
+
+        # keyboard
+        # 计算需要填充的帧数
+        _logger.debug(f"{self.record}: 正在构造键盘数据块")
+        remainder = self.info["total_frames"] % self.BLOCK_SIZE
+        if remainder != 0:
+            padding_size = self.BLOCK_SIZE - remainder
+            kb_data = np.pad(self.kb_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
+
+        # 切分为 (x, self.BLOCK_SIZE, 7) 的三维数组
+        x = kb_data.shape[0] // self.BLOCK_SIZE
+        self.kb_block = kb_data.reshape(x, self.BLOCK_SIZE, 7)
+        
         
         # mouse
+        _logger.debug(f"{self.record}: 正在构建鼠标数据块")
+        self.ms_event = np.zeros((self.info["total_frames"], 2), dtype=np.uint16)
         with open(self.ms_file,mode='r',encoding="utf-8") as fp:
             while True:
-                line = fp.read()
+                line = fp.readline()
                 if(line == ''):break
-                self.ms_event.append(line.strip().split(','))
+                # 此处只处理移动事件，第一列表示类型的不用管
+                _, x, y, frame_number = line.strip().split('\t')
+                try:
+                    self.ms_event[int(frame_number)] = [int(x),int(y)]
+                except OverflowError:
+                    # 可能会出现坐标值小于0的情况，原因暂时未知
+                    _logger.error(f"{repr(self)}: 帧 {frame_number} 错误的位置值({x},{y})")
+                    continue
+                # 计算需要填充的帧数
 
-    def get_block(idx):
-        pass
+        if remainder != 0:
+            padding_size = self.BLOCK_SIZE - remainder
+            ms_data = np.pad(self.ms_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
+        x = ms_data.shape[0] // self.BLOCK_SIZE
+        self.ms_block = ms_data.reshape(x, self.BLOCK_SIZE, 2)
+            
 
-    def init_mem_queue():
-        pass
+    def get_block(self,idx):
+        '''
+        获取第idx个100帧块
+        '''
+        return self.kb_block[idx],self.ms_block[idx]
+    
+    def get_frame(self,idx,use_large=False):
+        '''
+        获取某一帧的原图像和光流图像
+        '''
+        if not self.clip_in_ram:
+            self.load_clip_from_disk()
+        
+        if(use_large):
+            self.video_obj["raw"].set(cv2.CAP_PROP_POS_FRAMES, idx)
+            self.video_obj["flow"].set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, raw_frame = self.video_obj["raw"].read()
+            ret, flow_frame = self.video_obj["flow"].read()
 
-    def load_clip_from_disk(self):
+            if not ret:
+                raise ValueError(f"无法读取帧 {idx}")
+            
+            return raw_frame ,flow_frame
+        
+        # 默认读取小视频
+        self.video_obj["raw_S"].set(cv2.CAP_PROP_POS_FRAMES, idx)
+        self.video_obj["flow_S"].set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret1, raw_frame = self.video_obj["raw_S"].read()
+        ret2, flow_frame = self.video_obj["flow_S"].read()
+
+        if (not ret1) or (not ret2):
+            raise ValueError(f"无法读取帧 {idx}")
+        
+        return raw_frame ,flow_frame
+
+    # def get_frame_range(self,begin,end,use_large=False):
+    #     """
+    #     使用 FFmpeg 将视频帧提取到内存中。
+
+    #     参数:
+    #         begin (int): 起始帧号（从0开始）。
+    #         end (int): 结束帧号（包含）。
+
+    #     返回:
+    #         frames (list): 提取的帧列表，每个帧为 numpy 数组。
+    #     """
+    #     # 构建 FFmpeg 命令
+    #     if(use_large):
+    #         command_raw = [
+    #             "ffmpeg",
+    #             "-i", self.raw_clip_file,  # 输入视频文件
+    #             "-vf", f"select=between(n\\,{begin}\\,{end})",  # 选择帧区间
+    #             "-vsync", "vfr",  # 防止重复帧
+    #             "-f", "image2pipe",  # 输出到管道
+    #             "-pix_fmt", "bgr24",  # 像素格式为 BGR（OpenCV 默认格式）
+    #             "-vcodec", "rawvideo",  # 原始视频编码
+    #             "-"  # 输出到标准输出
+    #         ]
+
+    #         command_flow = [
+    #             "ffmpeg",
+    #             "-i", self.flow_clip_file,  # 输入视频文件
+    #             "-vf", f"select=between(n\\,{begin}\\,{end})",  # 选择帧区间
+    #             "-vsync", "vfr",  # 防止重复帧
+    #             "-f", "image2pipe",  # 输出到管道
+    #             "-pix_fmt", "bgr24",  # 像素格式为 BGR（OpenCV 默认格式）
+    #             "-vcodec", "rawvideo",  # 原始视频编码
+    #             "-"  # 输出到标准输出
+    #         ]
+    #     else:
+    #         command_raw = [
+    #             "ffmpeg",
+    #             "-i", self.raw_clip_file_S,  # 输入视频文件
+    #             "-vf", f"select=between(n\\,{begin}\\,{end})",  # 选择帧区间
+    #             "-vsync", "vfr",  # 防止重复帧
+    #             "-f", "image2pipe",  # 输出到管道
+    #             "-pix_fmt", "bgr24",  # 像素格式为 BGR（OpenCV 默认格式）
+    #             "-vcodec", "rawvideo",  # 原始视频编码
+    #             "-"  # 输出到标准输出
+    #         ]
+
+    #         command_flow = [
+    #             "ffmpeg",
+    #             "-i", self.flow_clip_file_S,  # 输入视频文件
+    #             "-vf", f"select=between(n\\,{begin}\\,{end})",  # 选择帧区间
+    #             "-vsync", "vfr",  # 防止重复帧
+    #             "-f", "image2pipe",  # 输出到管道
+    #             "-pix_fmt", "bgr24",  # 像素格式为 BGR（OpenCV 默认格式）
+    #             "-vcodec", "rawvideo",  # 原始视频编码
+    #             "-"  # 输出到标准输出
+    #         ]
+
+    #     # 启动 FFmpeg 进程
+    #     process_raw = subprocess.Popen(command_raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #     process_flow = subprocess.Popen(command_flow, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    #     # 读取帧数据
+    #     frames_raw = []
+    #     frames_flow = []
+    #     # frame_size = (int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_WIDTH)),
+    #                 # int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_HEIGHT)))
+    #     if(use_large):
+    #         frame_size = (self.info["original_width"], self.info["original_height"])
+    #     frame_size = (self.info["s_width"], self.info["s_height"])
+    #     frame_bytes = frame_size[0] * frame_size[1] * 3  # 每帧的字节数（BGR格式）
+
+    #     while True:
+    #         # 从管道中读取一帧的字节数据
+    #         raw_frame = process_raw.stdout.read(frame_bytes)
+    #         flow_frame = process_flow.stdout.read(frame_bytes)
+    #         if not raw_frame:
+    #             break
+
+    #         # 将字节数据转换为 numpy 数组
+    #         raw_np = np.frombuffer(raw_frame, dtype=np.uint8).reshape((frame_size[1], frame_size[0], 3))
+    #         flow_np = np.frombuffer(flow_frame, dtype=np.uint8).reshape((frame_size[1], frame_size[0], 3))
+    #         frames_raw.append(raw_np)
+    #         frames_flow.append(flow_np)
+
+    #     # 等待 FFmpeg 进程结束
+    #     process_raw.wait()
+    #     process_flow.wait()
+
+    #     return frames_raw,frames_flow
+
+    def get_frame_range(self,begin,end):
+        if not(self.clip_in_ram):
+            self.load_clip_from_disk()
+        
+        return self.raw_clip_frames[begin:end,:], self.flow_clip_frames[begin:end,:]
+
+    def release_clip(self):
+        '''
+        释放内存中的帧信息
+        '''
+        for key,cap in self.video_obj.items():
+            cap.release()
+        
+        self.raw_clip_frames = None
+        self.flow_clip_frames = None
+        self.kb_block = None
+        self.ms_block = None
+        self.kb_event = None
+        self.ms_event = None
+        self.clip_in_ram = False
+        gc.collect()
+
+        _logger.debug(f"{self.record} : 已清理")
+
+    def load_clip_from_disk(self,use_large=False):
         if(self.clip_in_ram):
             return
         
         # load 
-        pass
+        if(self.video_obj is None):
+            self.video_obj = dict()
+
+        if("flag_raw_S" in self.info):
+            self.video_obj["raw_S"] = cv2.VideoCapture(self.raw_clip_file_S)
+        if("flag_flow_S" in self.info):
+            self.video_obj["flow_S"] = cv2.VideoCapture(self.flow_clip_file_S)
+        if(use_large and "flag_raw" in self.info):
+            self.video_obj["raw"] = cv2.VideoCapture(self.raw_clip_file)
+        if(use_large and "flag_flow" in self.info):
+            self.video_obj["flow"] = cv2.VideoCapture(self.flow_clip_file)
+        
+        if(use_large):
+            raw_video_reader = self.video_obj["raw"]
+            flow_video_reader = self.video_obj["flow"]
+        else:
+            raw_video_reader = self.video_obj["raw_S"]
+            flow_video_reader = self.video_obj["flow_S"]
+
+        self.raw_clip_frames = list()
+        self.flow_clip_frames = list()
+
+        while True:
+            ret1, raw_frame = raw_video_reader.read()
+            ret2, flow_frame = flow_video_reader.read()
+
+            if (not ret1) or (not ret2):
+                break
+
+            self.raw_clip_frames.append(raw_frame)
+            self.flow_clip_frames.append(flow_frame)
+
+        # _logger.info(self.raw_clip_frames)
+
+        self.raw_clip_frames = np.array(self.raw_clip_frames,dtype=np.uint8)
+        self.flow_clip_frames = np.array(self.flow_clip_frames,dtype=np.uint8)
+
+        # _logger.debug(self.raw_clip_frames.shape)
+
+        remainder = self.info["total_frames"] % self.BLOCK_SIZE
+        if remainder == 0:
+            return  # 无需填充
+
+        padding_size = self.BLOCK_SIZE - remainder + 1
+
+        # 创建填充帧, 填充值为0
+        padding_shape = (padding_size,) + self.raw_clip_frames.shape[1:]
+        padding_frames = np.full(padding_shape, 0, dtype=np.uint8)
+
+        # _logger.debug(self.raw_clip_frames.shape)
+        # _logger.debug(padding_frames.shape)
+
+        # 合并原始帧和填充帧
+        self.raw_clip_frames = np.concatenate([self.raw_clip_frames, padding_frames], axis=0)
+        self.flow_clip_frames = np.concatenate([self.flow_clip_frames, padding_frames], axis=0)
+
+        self.clip_in_ram = True
+
+    def __len__(self):
+        return len(self.kb_block)
 
 
 class Genshin_Basic_Control_Dataset(Dataset):
     def __init__(self,
                  record_path,
-
+                
+                **kwargs
                  ):
         '''
         初始化用于训练动作控制模型的数据集
+        由于训练集实在太大，采用memmap方式进行实现
         
         Args:
-            record_path (str) : 需要传入record.txt的路径
+            record_path (str) : 需要传入指向record.txt的路径
         '''
 
         self.capture_dir = os.path.dirname(record_path)
         self.mouse_data = dict()
         self.keyboard_data = dict()
     
+        # 读取记录
+        self.records = list() # record记录号
+        self.record_objs = list() # record对象
+        with open(record_path,mode='r',encoding="utf-8") as fp:
+            for record in fp.readlines():
+                record = record.strip()
+                self.records.append(record)
+                self.record_objs.append(Control_Record(self.capture_dir,record))
 
+        if("block_size" in kwargs):
+            self.BLOCK_SIZE = kwargs["block_size"]
+        else:
+            self.BLOCK_SIZE = 100
+
+        self.X_mapfile = os.path.join(self.capture_dir,"GSDataset_X.memmap")
+        self.Y_mapfile = os.path.join(self.capture_dir,"GSDataset_Y.memmap")
+        self.X = None
+        self.Y = None
+
+        self.process_records()
+
+        self.TOTAL_ROWS = self.X.shape[0]
 
     def __len__(self):
         """
         返回数据集的大小
         """
-        return len(self.image_paths)
+        return self.X.shape[0]
 
-    def __getitem__(self, index):
+    def __getitem__(self, idx):
         """
         根据索引返回一个数据样本
         :param index: 索引
         """
-        pass
+        """
+        按索引获取数据。
 
+        参数:
+            idx (int): 数据索引。
+
+        返回:
+            x_block (np.array): X 序列的块。
+            y_block (np.array): Y 序列的块。
+        """
+        start = idx * self.BLOCK_SIZE
+        end = min((idx + 1) * self.BLOCK_SIZE, self.TOTAL_ROWS)
+
+        # 读取 X 和 Y 的块
+        x_block = self.X[start:end]
+        y_block = self.Y[start:end]
+
+        return x_block, y_block
+
+    def _init_mem_queue(self,queue_size=10):
+        self._mem_queue = queue.Queue(queue_size)
+
+    def _create_or_extend_memmap(self, file_path, dtype, shape, mode="r+"):
+        """
+        创建或扩展 np.memmap 文件。
+
+        参数:
+            file_path (str): 文件路径。
+            dtype: 数据类型。
+            shape (tuple): 文件的形状。
+            mode (str): 文件模式（"r+" 表示读写）。
+
+        返回:
+            memmap (np.memmap): 内存映射文件对象。
+        """
+        if os.path.exists(file_path):
+            # 如果文件已存在，扩展其大小
+            existing_memmap = np.memmap(file_path, dtype=dtype, mode="r")
+
+            # 计算现有文件的总元素数
+            total_elements = existing_memmap.size
+            
+            # 计算预期的总元素数
+            expected_elements = np.prod(shape[1:])
+
+            # 计算现有文件的帧数
+            num_frames = total_elements // expected_elements
+            
+            # 将 existing_memmap reshape 为正确的形状
+            existing_memmap = existing_memmap.reshape((num_frames,) + shape[1:])
+
+            # _logger.debug(existing_memmap.shape)
+            # _logger.debug(shape)
+            new_shape = (existing_memmap.shape[0] + shape[0],) + existing_memmap.shape[1:]
+            memmap = np.memmap(file_path, dtype=dtype, mode=mode, shape=new_shape)
+        else:
+            # 如果文件不存在，创建新文件
+            memmap = np.memmap(file_path, dtype=dtype, mode="w+", shape=shape)
+        return memmap
     
+    def _load_memmap_fp(self):
+        with open(self.info_file,mode="r",encoding="utf-8") as fp:
+            memmap_info = json.load(fp)
+            self.X = np.memmap(self.X_mapfile, dtype=np.uint8, mode="r", shape=memmap_info["X_shape"])
+            self.Y = np.memmap(self.Y_mapfile, dtype=np.uint16, mode="r", shape=memmap_info["Y_shape"])
 
+    def process_records(self):
+        """
+        将类中的records转化为可供使用的数据集
+        """
+        if(os.path.exists(self.X_mapfile) and os.path.exists(self.Y_mapfile)):
+            _logger.info(f"{repr(self)}: 数据集已存在，直接读取")
+            self._load_memmap_fp()
+            return
+        
+        process_info = dict()
+        self._rec_offset = dict() # 用于记录每个录像文件对应的offset
+        offset = 0
+
+        for i,record_obj in enumerate(self.record_objs):
+            record_obj:Control_Record
+            record_obj.make_control_seq()
+
+            self._rec_offset[record_obj.record] = offset
+            offset += record_obj.info["total_frames"]
+
+            for j in range(len(record_obj)):
+                kb_block, ms_block = record_obj.get_block(j)
+                raw_frames, flow_frames = record_obj.get_frame_range(j*record_obj.BLOCK_SIZE,(j+1)*record_obj.BLOCK_SIZE)
+
+                X_append = np.concatenate([raw_frames, flow_frames], axis=-1)
+                Y_append = np.concatenate([kb_block, ms_block], axis=-1)
+
+                # _logger.debug(X_append.shape)
+                # _logger.debug(Y_append.shape)
+
+                self.X = self._create_or_extend_memmap(self.X_mapfile,np.uint8,X_append.shape)
+                self.X[-X_append.shape[0]:] = X_append
+                self.X.flush()
+
+                self.Y = self._create_or_extend_memmap(self.Y_mapfile,np.uint16,Y_append.shape)
+                self.Y[-Y_append.shape[0]:] = Y_append
+                self.Y.flush()
+
+                _logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
+                # _logger.debug(self.X.shape)
+                # _logger.debug(self.Y.shape)
+
+            del X_append
+            del Y_append
+            del kb_block
+            del ms_block
+            del raw_frames
+            del flow_frames
+            record_obj.release_clip()
+            # _logger.debug(f"{len(self.X)}")
+            # _logger.debug(f"{len(self.Y)}")
+        
+        process_info["X_shape"] = list(self.X.shape)
+        process_info["Y_shape"] = list(self.Y.shape)
+
+        self.info_file = os.path.join(self.capture_dir,"GSDataset_info.json")
+        with open(self.info_file,mode="w",encoding="utf-8") as fp:
+            json.dump(process_info,fp)
 
 def process_raw_csv(path:str,record:str,**kwargs):
     '''
@@ -208,7 +672,7 @@ def process_mouse_record(event:str,**kwargs):
         return ''
     
 
-def clip_compression(path:str,record:str,**kwargs):
+def clip_compression_moviepy(path:str,record:str,**kwargs):
     '''
     压缩录制的原生视频
 
@@ -234,7 +698,7 @@ def clip_compression(path:str,record:str,**kwargs):
 
     # 如果压制视频已存在, 则不作任何更改
     if(os.path.exists(os.path.join(path,output_video))):
-        _logger.info(f"{output_video} 已存在")
+        _logger.info(f"已存在 {output_video}")
         return
 
     # 加载视频
@@ -301,14 +765,15 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     output_video_path = os.path.join(path,output_video)
 
     # 如果压制视频已存在, 则不作任何更改
+    calc = True
     if(os.path.exists(os.path.join(path,output_video))):
-        _logger.info(f"{output_video} 已存在")
-        return
+        _logger.info(f"已存在 {output_video}")
+        calc = False
     
-        # 检查OpenCV是否支持CUDA
-    if not cv2.cuda.getCudaEnabledDeviceCount():
-        print("CUDA is not available. Please install OpenCV with CUDA support.")
-        return
+    # 检查OpenCV是否支持CUDA
+    # if not cv2.cuda.getCudaEnabledDeviceCount():
+    #     print("CUDA不可用，请安装CUDA版OpenCV")
+    #     return
 
     # 打开输入视频
     cap = cv2.VideoCapture(input_video_path)
@@ -322,41 +787,41 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
+    if(calc):
+        # 设置输出视频的编码器和属性
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MP4编码器
+        out = cv2.VideoWriter(output_video_path, fourcc, original_fps, (new_width, new_height))
 
-    # 设置输出视频的编码器和属性
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MP4编码器
-    out = cv2.VideoWriter(output_video_path, fourcc, original_fps, (new_width, new_height))
+        # 创建CUDA加速的帧处理管道
+        cuda_stream = cv2.cuda_Stream()  # 创建CUDA流
+        # cuda_resizer = cv2.cuda_Resize(new_width, new_height)  # 创建CUDA缩放器
 
-    # 创建CUDA加速的帧处理管道
-    cuda_stream = cv2.cuda_Stream()  # 创建CUDA流
-    # cuda_resizer = cv2.cuda_Resize(new_width, new_height)  # 创建CUDA缩放器
+        _logger.info(f"正在压制 {input_video}")
+        _logger.info(f"目标大小: {new_width}*{new_height}")
 
-    _logger.info(f"正在压制 {input_video}")
-    _logger.info(f"目标大小: {new_width}*{new_height}")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break  # 视频结束
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break  # 视频结束
+            # 将帧上传到GPU
+            gpu_frame = cv2.cuda_GpuMat()
+            gpu_frame.upload(frame, stream=cuda_stream)
 
-        # 将帧上传到GPU
-        gpu_frame = cv2.cuda_GpuMat()
-        gpu_frame.upload(frame, stream=cuda_stream)
+            # 使用CUDA进行缩放
+            # resized_gpu_frame = cuda_resizer.apply(gpu_frame, stream=cuda_stream)
+            resized_gpu_frame = cv2.cuda.resize(gpu_frame, (new_width, new_height), stream=cuda_stream)
 
-        # 使用CUDA进行缩放
-        # resized_gpu_frame = cuda_resizer.apply(gpu_frame, stream=cuda_stream)
-        resized_gpu_frame = cv2.cuda.resize(gpu_frame, (new_width, new_height), stream=cuda_stream)
+            # 将缩放后的帧下载回CPU
+            resized_frame = resized_gpu_frame.download(stream=cuda_stream)
 
-        # 将缩放后的帧下载回CPU
-        resized_frame = resized_gpu_frame.download(stream=cuda_stream)
+            # 写入输出视频
+            out.write(resized_frame)
 
-        # 写入输出视频
-        out.write(resized_frame)
-
-    # 释放资源
-    cap.release()
-    out.release()
-    _logger.info(f"压制完成 {output_video}")
+        # 释放资源
+        cap.release()
+        out.release()
+        _logger.info(f"压制完成 {output_video}")
 
     # 存储原始属性
     with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
@@ -364,14 +829,22 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
         video_info["original_fps"] = original_fps
         video_info["original_width"] = original_width
         video_info["original_height"] = original_height
+        video_info["s_width"] = new_width
+        video_info["s_height"] = new_height
         video_info["total_frames"] = total_frames
         video_info["flag_raw"] = True
         video_info["flag_raw_S"] = True
         json.dump(video_info,fp)
         _logger.info(f"视频信息已存储 {input_video}")
 
+def choose_clip_compression(path:str,record:str,**kwargs):
+    # 检查OpenCV是否支持CUDA
+    if not cv2.cuda.getCudaEnabledDeviceCount():
+        clip_compression_moviepy(path,record,**kwargs)
+    else:
+        clip_compression_opencv(path,record,**kwargs)
 
-@timer_logger
+# @timer_logger
 def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwargs):
     '''
     光流计算, 使用OpenCV
@@ -402,11 +875,16 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # 创建视频写入对象
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 视频编码格式
-    out = cv2.VideoWriter(os.path.join(record_dir,output_video), fourcc, fps, (width, height))
+    calc = True
+    if(os.path.exists(os.path.join(record_dir,output_video))):
+        _logger.info(f"光流视频已存在，不进行计算 {output_video}")
+        calc = False
+    else:
+        # 创建视频写入对象
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 视频编码格式
+        out = cv2.VideoWriter(os.path.join(record_dir,output_video), fourcc, fps, (width, height))
 
-    if cuda_available:
+    if cuda_available and calc:
         # 创建 CUDA 光流对象
         cuda_farneback = cv2.cuda_FarnebackOpticalFlow.create(
             numLevels=5,      # 金字塔层数
@@ -429,6 +907,8 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
         prev_gpu = cv2.cuda_GpuMat()
         prev_gpu.upload(prev_gray)
+
+        _i = 0
 
         # 处理每一帧
         while True:
@@ -463,6 +943,10 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
             # 更新前一帧
             prev_gpu = curr_gpu
 
+            _i-=-1
+            if(_i % 1000 == 0):
+                _logger.info(f"正在处理第 {_i} 帧")
+
         # 释放资源
         cap.release()
         out.release()
@@ -470,7 +954,7 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
 
         _logger.info(f"光流视频已保存到: {os.path.join(record_dir,input_video)}")
 
-    else:
+    elif calc:
         # 读取第一帧并转换为灰度图像
         ret, old_frame = cap.read()
         if not ret:
@@ -523,8 +1007,9 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         out.release()
         cv2.destroyAllWindows()
 
-    with open(os.path.join(record_dir,f"{record}_info.json"),mode='w+',encoding="utf-8") as fp:
+    with open(os.path.join(record_dir,f"{record}_info.json"),mode="r",encoding="utf-8") as fp:
         info = json.load(fp)
+    with open(os.path.join(record_dir,f"{record}_info.json"),mode="w",encoding="utf-8") as fp:
         if(use_large):
             info["flag_flow"] = True
         else:
@@ -633,20 +1118,15 @@ def transfer_capture_dir(dir:str):
 
         process_raw_csv(path=dir, record=csv_file.stem)
         # clip_compression(path=dir, record=csv_file.stem)
-        clip_compression_opencv(path=dir,record=csv_file.stem)
+        # clip_compression_opencv(path=dir,record=csv_file.stem)
+        choose_clip_compression(path=dir,record=csv_file.stem)
         calculate_optical_flow(record_dir=dir,record=csv_file.stem,)
         # calculate_opticcal_flow_torch(record_dir=dir,record=csv_file.stem)
 
-    records = list()
-    with open(os.path.join(dir,"records.txt"),mode='r',encoding="utf-8") as fp:
-        records = fp.readlines()
-
-    # 读取每个record，并把帧信息存入Dataset
-    for i,record in enumerate(records):
-        record = record.strip()
+    return Genshin_Basic_Control_Dataset(os.path.join(dir,"records.txt"))
 
 
 if __name__ == "__main__":
 
-    transfer_capture_dir("E:\\User\\Pictures\\yolo_pics\\genshin_train\\capture\\2025-03-05")
+    transfer_capture_dir("E:\\User\\Pictures\\yolo_pics\\genshin_train\\capture\\record_all_0319")
     pass
