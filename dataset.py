@@ -93,11 +93,11 @@ class Control_Record():
             ctrl    101
             space   109
             X       31
-            共7个键
+            共8个键
         """
 
         # 初始化全零数组
-        key_status = np.zeros((self.info["total_frames"],7), dtype=np.uint16)
+        key_status = np.zeros((self.info["total_frames"],8), dtype=np.uint16)
         key_events = {
             # ( [press], [release] )
             "12":([],[]),    # W
@@ -146,9 +146,9 @@ class Control_Record():
             padding_size = self.BLOCK_SIZE - remainder
             kb_data = np.pad(self.kb_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
 
-        # 切分为 (x, self.BLOCK_SIZE, 7) 的三维数组
+        # 切分为 (x, self.BLOCK_SIZE, 8) 的三维数组
         x = kb_data.shape[0] // self.BLOCK_SIZE
-        self.kb_block = kb_data.reshape(x, self.BLOCK_SIZE, 7)
+        self.kb_block = kb_data.reshape(x, self.BLOCK_SIZE, 8)
         
         
         # mouse
@@ -408,6 +408,7 @@ class Genshin_Basic_Control_Dataset(Dataset):
         self.capture_dir = os.path.dirname(record_path)
         self.mouse_data = dict()
         self.keyboard_data = dict()
+        self.info_file = os.path.join(self.capture_dir,"GSDataset_info.json")
     
         # 读取记录
         self.records = list() # record记录号
@@ -436,7 +437,7 @@ class Genshin_Basic_Control_Dataset(Dataset):
         """
         返回数据集的大小
         """
-        return self.X.shape[0]
+        return self.TOTAL_ROWS // self.BLOCK_SIZE
 
     def __getitem__(self, idx):
         """
@@ -460,7 +461,12 @@ class Genshin_Basic_Control_Dataset(Dataset):
         x_block = self.X[start:end]
         y_block = self.Y[start:end]
 
-        return x_block, y_block
+        x_tensor = torch.from_numpy(x_block.copy()).float()  # [T,H,W,C]
+        x_tensor = x_tensor.permute(0, 3, 1, 2)  # [T,C,H,W]
+
+        y_tensor = torch.from_numpy(y_block.copy()).float()  # [T,H,W,C]
+
+        return x_tensor, y_tensor
 
     def _init_mem_queue(self,queue_size=10):
         self._mem_queue = queue.Queue(queue_size)
@@ -564,7 +570,7 @@ class Genshin_Basic_Control_Dataset(Dataset):
         process_info["X_shape"] = list(self.X.shape)
         process_info["Y_shape"] = list(self.Y.shape)
 
-        self.info_file = os.path.join(self.capture_dir,"GSDataset_info.json")
+        # self.info_file = os.path.join(self.capture_dir,"GSDataset_info.json")
         with open(self.info_file,mode="w",encoding="utf-8") as fp:
             json.dump(process_info,fp)
 
@@ -1124,6 +1130,34 @@ def transfer_capture_dir(dir:str):
         # calculate_opticcal_flow_torch(record_dir=dir,record=csv_file.stem)
 
     return Genshin_Basic_Control_Dataset(os.path.join(dir,"records.txt"))
+
+
+def Make_Dataset(capture_dir:str,train_rate=0.8,val_rate=0.1):
+    '''
+    构建控制训练数据集
+
+    Args:
+        capture_dir:数据集路径
+        train_rate:训练集占比(默认0.8)
+        val_rate:评估集占比(默认0.1)
+    
+    Return:
+        train_set, test_set, val_set
+    '''
+    full_dataset = transfer_capture_dir(capture_dir)
+
+    # 自动划分（需要提前知道数据总量）
+    train_size = int(train_rate * len(full_dataset))
+    val_size = int(val_rate * len(full_dataset))
+    test_size = len(full_dataset) - train_size - val_size
+
+    train_set, val_set, test_set = torch.utils.data.random_split(
+        full_dataset, 
+        [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)  # 固定随机种子
+    )
+
+    return train_set,test_set,val_set
 
 
 if __name__ == "__main__":
