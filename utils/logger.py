@@ -12,6 +12,8 @@ sys.path.append(parent_dir)
 from config import DEBUG
 from utils.file_utils import exist_path
 
+__logger = None
+
 class Console_Logger(object):
     def __init__(self, filename='default.log', stream=sys.stdout):
         self.terminal = stream
@@ -25,7 +27,7 @@ class Console_Logger(object):
         pass
 
 def Enable_Console_Logger():
-    exist_path(".\\logs")
+    # exist_path(".\\logs")
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE,"w") as fp:
             pass
@@ -44,24 +46,33 @@ def timer_logger(func):
 
 def get_stream_logger():
     exist_path(f".\\logs\\{datetime.datetime.now().strftime('%Y-%m-%d')}")
-    # 创建日志处理器
-    console_handler = logging.StreamHandler(sys.stdout)
-    file_handler = logging.FileHandler(LOG_FILE)
 
-    # 创建日志格式器
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
+    # 全局Logger初始化
+    global __logger
+    if __logger is None:
+        # 启用控制台记录
+        Enable_Console_Logger()
+        
+        # 创建日志处理器
+        console_handler = logging.StreamHandler(sys.stdout)
+        file_handler = logging.FileHandler(LOG_FILE)
 
-    # 获取日志器并添加处理器
-    logger = logging.getLogger()
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
+        # 创建日志格式器
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        console_handler.setFormatter(formatter)
+        file_handler.setFormatter(formatter)
 
-    if(DEBUG):
-        console_handler.setLevel(logging.DEBUG)
-        file_handler.setLevel(logging.DEBUG)
-        logger.setLevel(logging.DEBUG)
-        # logger.debug("现在运行于 DEBUG 模式")
-    
-    return logger
+        # 获取日志器并添加处理器
+        logger = logging.getLogger()
+        logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
+
+        if(DEBUG):
+            console_handler.setLevel(logging.DEBUG)
+            file_handler.setLevel(logging.DEBUG)
+            logger.setLevel(logging.DEBUG)
+            # logger.debug("现在运行于 DEBUG 模式")
+        
+        __logger = logger
+
+    return __logger

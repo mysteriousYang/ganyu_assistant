@@ -1,12 +1,16 @@
+#-*- coding: utf-8 -*-
+import gc
+import sys
+import datetime
 import torch
+import objgraph
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 
-# from torch.utils.data import DataLoader
 from torchvision.models import resnet18
-# from torchvision import models
+from memory_profiler import profile
 from sklearn.metrics import accuracy_score
 from dataset import Make_Dataset
 from dataloader import Make_Dataloader
@@ -27,14 +31,19 @@ class Config:
     seq_length = 100
     
     # 训练参数
-    batch_size = 16
+    batch_size = 1
     lr = 1e-4
     epochs = 50
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 路径配置
-    checkpoint_path = ".\\models\\checkpoints\\best_model.pth"
+    # checkpoint_path = ".\\models\\checkpoints\\" + datetime.datetime.now().strftime('%Y-%m-%d') + ".pth"
+    best_model_path = ".\\models\\checkpoints\\best_model.pth"
     dataset_path = "E:\\User\\Pictures\\yolo_pics\\genshin_train\\capture\\record_all_0319"
+
+    def checkpoint_path(self,epoch):
+        checkpoint_path =  ".\\models\\checkpoints\\" + datetime.datetime.now().strftime('%Y-%m-%d') + f"e{epoch}.pth"
+        return checkpoint_path
 
 # 数据预处理（需要在Dataset中实现）
 # def preprocess_data(x_block, y_block):
@@ -74,13 +83,19 @@ class TemporalEnhancedNet(nn.Module):
         # self.spatial_net.conv1 = nn.Conv2d(6, 64, kernel_size=7, 
         #                                  stride=2, padding=3, bias=False)
         self.spatial_net = resnet18(pretrained=True)
-        self.spatial_net.conv1 = nn.Conv2d(6, 64, kernel_size=3, stride=2, padding=3, bias=False)  # 适应小尺寸输入
+        self.spatial_net.conv1 = nn.Conv2d(6, 64, kernel_size=7, stride=2, padding=3, bias=False)  # 适应小尺寸输入
 
 
         # 保留预训练权重（重要技巧）
+        # with torch.no_grad():
+        #     self.spatial_net.conv1.weight[:, :3] = self.spatial_net.conv1.weight[:, :3].clone()
+        #     self.spatial_net.conv1.weight[:, 3:] = self.spatial_net.conv1.weight[:, :3].clone()
+          # 权重初始化技巧（关键！）
         with torch.no_grad():
-            self.spatial_net.conv1.weight[:, :3] = self.spatial_net.conv1.weight[:, :3].clone()
-            self.spatial_net.conv1.weight[:, 3:] = self.spatial_net.conv1.weight[:, :3].clone()
+            # 复制原3通道权重到新6通道（前3通道复制RGB权重，后3通道复制光流权重）
+            original_weight = self.spatial_net.conv1.weight[:, :3].clone()
+            self.spatial_net.conv1.weight = nn.Parameter(torch.cat([original_weight, original_weight], dim=1))
+
         # 替换全连接层
         # self.spatial_net.fc = nn.Identity()
         self.spatial_net.fc = nn.Linear(self.spatial_net.fc.in_features, 512)
@@ -113,6 +128,7 @@ class TemporalEnhancedNet(nn.Module):
             nn.Linear(256, 2)
         )
         
+    # @profile(precision=5)
     def forward(self, x):
         # x形状: [B, T, H, W, C]
         # B, T, H, W, C = x.shape
@@ -121,10 +137,16 @@ class TemporalEnhancedNet(nn.Module):
         # spatial_feat = x.view(B*T, H, W, C).permute(0, 3, 1, 2)  # [B*T,C,H,W]
         # spatial_feat = self.spatial_net(spatial_feat)  # [B*T, 512]
         # spatial_feat = spatial_feat.view(B, T, -1)    # [B, T, 512]
-        B, T, H, W, C = x.shape
-        x = x.to(torch.float32)  # 新增类型转换
+        B, T, C, H, W = x.shape # B,T,C,H,W
+        # _logger.info(x.shape)
+        # x = x.to(torch.float32)  # 新增类型转换
     
-        x_reshaped = x.view(-1, H, W, C).permute(0, 3, 1, 2)  # [B*T, C, H, W]
+        # x_reshaped = x.view(-1, C, H, W).permute(0, 3, 1, 2)  # [B*T, C, H, W]
+        # x_reshaped = x.view(-1, H, W, C).permute(0,3,1,2)
+        # 直接调整维度顺序避免后续重塑
+        x_reshaped = x.permute(0,1,3,4,2)  # B,T,H,W,C → B,T,H,W,C → 不需要额外重塑
+        x_reshaped = x_reshaped.reshape(-1, C, H, W)  # [B*T, C, H, W]
+
         # 添加尺寸调整（关键步骤）
         x_resized = F.interpolate(
             x_reshaped, 
@@ -132,7 +154,7 @@ class TemporalEnhancedNet(nn.Module):
             mode='bilinear'
         )
         spatial_feat = self.spatial_net(x_resized)  # [B*T, 512]
-        _logger.info(spatial_feat)
+        # _logger.info(spatial_feat)
         spatial_feat = spatial_feat.view(B, T, -1)  # [B, T, 512]
         
         # 添加位置编码
@@ -170,7 +192,7 @@ class MultiTaskLoss(nn.Module):
         return 1.0 * loss_key + 0.5 * loss_mouse
 
 # 训练流程
-def train_model(model, train_loader, val_loader, config):
+def train_model(model, train_loader, val_loader, config:Config):
     _logger.debug("正在开始训练")
     model = model.to(config.device)
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
@@ -182,9 +204,9 @@ def train_model(model, train_loader, val_loader, config):
         # 训练阶段
         model.train()
         train_loss = []
+        # snapshot1 = tracemalloc.take_snapshot()
+        i = 0
         for x, y in train_loader:
-            _logger.info(x.shape)
-            _logger.info(y.shape)
             x = x.to(config.device)  # [B, T, H, W, C]
             y = y.to(config.device)  # [B, T, 10]
             
@@ -194,8 +216,45 @@ def train_model(model, train_loader, val_loader, config):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)  # 彻底释放梯度
             
             train_loss.append(loss.item())
+            # _logger.debug(f"loss_size:{sys.getsizeof(train_loss)}")
+
+            # objgraph.show_refs([x], filename='x_refs.png')
+            # ref1 = gc.get_referrers(x)
+            # ref2 = gc.get_referents(x)
+            # _logger.debug(ref1)
+            # _logger.debug(ref2)
+
+            # 显式释放
+            # _logger.debug("已释放x, y")
+            del x,y,pred,loss
+            torch.cuda.empty_cache()  # 清理GPU缓存
+            gc.collect()
+
+            i-=-1
+            if(i%100==0):
+                _logger.info(f"正在迭代 {i}/{len(train_loader)}")
+            # if(i==50):
+            #     _logger.debug("程序已停止")
+            #     exit(0)
+
+            # 内存查错部分
+            # snapshot2 = tracemalloc.take_snapshot()
+            # 显示内存分配最多的前10行代码
+            # top_stats = snapshot2.statistics("lineno")
+            # for stat in top_stats[:10]:
+            #     _logger.debug(f"文件: {stat.traceback[-1].filename}")
+            #     _logger.debug(f"行号: {stat.traceback[-1].lineno}")
+            #     _logger.debug(f"总内存: {stat.size / 1024:.2f} KB，分配次数: {stat.count}\n")
+
+            # diff_stats = snapshot2.compare_to(snapshot1, "lineno")
+            # for stat in diff_stats[:5]:
+            #     _logger.debug(f"内存增量: {stat.size_diff / 1024:.2f} KB，代码位置: {stat.traceback}")
+            # del snapshot2
+
+            
         
         # 验证阶段
         model.eval()
@@ -218,17 +277,22 @@ def train_model(model, train_loader, val_loader, config):
         # print(f"Epoch {epoch+1}/{config.epochs}")
         # print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
+        # 每10epochs保存
+        if (epoch%10==0):
+            torch.save(model.state_dict(), config.checkpoint_path(epoch))
+            _logger.info("模型记录点已保存！")
+
         # 保存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), config.checkpoint_path)
+            torch.save(model.state_dict(), config.best_model_path)
             _logger.info("模型已保存！")
     
     return model
 
 # 测试评估
-def evaluate_model(model, test_loader, config):
-    model.load_state_dict(torch.load(config.checkpoint_path))
+def evaluate_model(model, test_loader, config:Config):
+    model.load_state_dict(torch.load(config.best_model_path))
     model = model.to(config.device)
     model.eval()
     
@@ -277,6 +341,7 @@ def _check_paths():
 
 def run():
     _check_paths()
+    # tracemalloc.start(25) 
 
     # 初始化配置、模型、数据
     config = Config()
@@ -285,7 +350,7 @@ def run():
     # 假设已实现Genshin_Basic_Control_Dataset
     train_dataset, test_dataset, val_dataset = Make_Dataset(config.dataset_path,config.train_rate,config.val_rate)
     
-    train_loader = Make_Dataloader(train_dataset, batch_size=config.batch_size,shuffle=True)
+    train_loader = Make_Dataloader(train_dataset, batch_size=config.batch_size,shuffle=True,pin_memory=True)
     val_loader = Make_Dataloader(val_dataset, batch_size=config.batch_size)
     test_loader = Make_Dataloader(test_dataset,batch_size=config.batch_size)
     

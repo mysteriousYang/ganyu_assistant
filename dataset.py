@@ -12,6 +12,7 @@ import subprocess
 
 import numpy as np
 
+from memory_profiler import profile
 from typing import List
 from RAFT.raft import RAFT
 from RAFT.utils import flow_viz
@@ -439,6 +440,11 @@ class Genshin_Basic_Control_Dataset(Dataset):
         """
         return self.TOTAL_ROWS // self.BLOCK_SIZE
 
+    def __del__(self):
+        del self.X
+        del self.Y
+
+    # @profile
     def __getitem__(self, idx):
         """
         根据索引返回一个数据样本
@@ -461,12 +467,33 @@ class Genshin_Basic_Control_Dataset(Dataset):
         x_block = self.X[start:end]
         y_block = self.Y[start:end]
 
-        x_tensor = torch.from_numpy(x_block.copy()).float()  # [T,H,W,C]
-        x_tensor = x_tensor.permute(0, 3, 1, 2)  # [T,C,H,W]
+        # 方式1
+        # x_tensor = torch.from_numpy(x_block.copy()).float()  # [T,H,W,C]
+        # y_tensor = torch.from_numpy(y_block.copy()).float()  # [T,H,W,C]
 
-        y_tensor = torch.from_numpy(y_block.copy()).float()  # [T,H,W,C]
+        # 方式2
+        # x_tensor = torch.as_tensor(x_block).float()
+        # x_tensor = x_tensor.permute(0, 3, 1, 2)  # [T,C,H,W]
+        # y_tensor = torch.as_tensor(y_block).float()
+        # del x_block
+        # del y_block
+        # return x_tensor, y_tensor
 
-        return x_tensor, y_tensor
+        # 方式3
+        x_tensor = torch.from_numpy(x_block)  # 保持uint8类型 [T,H,W,C]
+        y_tensor = torch.from_numpy(y_block)  # 保持uint16类型 [T,H,W,C]
+        x_float = x_tensor.permute(0, 3, 1, 2).to(torch.float32)  # [T,C,H,W], float32
+        y_float = y_tensor.to(torch.float32)  # 按需转换
+
+        # 显式释放原始块（如果后续不再需要）
+        del x_block, y_block, x_tensor, y_tensor
+        gc.collect()
+        return x_float,y_float
+        
+
+        # x_block = self.X[start:end].copy()  # 关键：复制到新内存空间
+        # y_block = self.Y[start:end].copy()
+        # return torch.from_numpy(x_block), torch.from_numpy(y_block)
 
     def _init_mem_queue(self,queue_size=10):
         self._mem_queue = queue.Queue(queue_size)
