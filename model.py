@@ -12,7 +12,7 @@ import numpy as np
 from torchvision.models import resnet18
 from memory_profiler import profile
 from sklearn.metrics import accuracy_score
-from dataset import Make_Dataset
+from dataset import Make_Dataset,Get_Dataset_list,Control_Record
 from dataloader import Make_Dataloader
 from utils.logger import get_stream_logger
 from utils.file_utils import exist_path
@@ -45,32 +45,6 @@ class Config:
         checkpoint_path =  ".\\models\\checkpoints\\" + datetime.datetime.now().strftime('%Y-%m-%d') + f"e{epoch}.pth"
         return checkpoint_path
 
-# 数据预处理（需要在Dataset中实现）
-# def preprocess_data(x_block, y_block):
-#     """ 示例预处理流程 """
-#     # 归一化图像到[0,1]
-#     x_block = x_block.astype(np.float32) / 255.0
-    
-#     # 归一化鼠标坐标（假设屏幕分辨率480x272）
-#     y_block[:, 8:] = y_block[:, 8:] / np.array([480, 272])
-    
-#     # 转换为Tensor
-#     x_tensor = torch.from_numpy(x_block).permute(0, 3, 1, 2)  # [T,C,H,W]
-#     y_tensor = torch.from_numpy(y_block.astype(np.float32))
-    
-#     return x_tensor, y_tensor
-def preprocess_data(x_block, y_block):
-    # 转换数据类型到float32并归一化
-    x_block = x_block.astype(np.float32) / 255.0  # 关键步骤
-    
-    # 调整鼠标坐标归一化（示例）
-    y_block[:, 8:] = y_block[:, 8:] / np.array([480, 272])
-    
-    # 转换为Tensor
-    x_tensor = torch.from_numpy(x_block).permute(0, 3, 1, 2)  # [T,C,H,W]
-    y_tensor = torch.from_numpy(y_block.astype(np.float32))
-    
-    return x_tensor, y_tensor
 
 # 改进的模型结构
 class TemporalEnhancedNet(nn.Module):
@@ -137,15 +111,15 @@ class TemporalEnhancedNet(nn.Module):
         # spatial_feat = x.view(B*T, H, W, C).permute(0, 3, 1, 2)  # [B*T,C,H,W]
         # spatial_feat = self.spatial_net(spatial_feat)  # [B*T, 512]
         # spatial_feat = spatial_feat.view(B, T, -1)    # [B, T, 512]
-        B, T, C, H, W = x.shape # B,T,C,H,W
+        B, T, H, W, C = x.shape # B,T,C,H,W
         # _logger.info(x.shape)
         # x = x.to(torch.float32)  # 新增类型转换
     
         # x_reshaped = x.view(-1, C, H, W).permute(0, 3, 1, 2)  # [B*T, C, H, W]
         # x_reshaped = x.view(-1, H, W, C).permute(0,3,1,2)
         # 直接调整维度顺序避免后续重塑
-        x_reshaped = x.permute(0,1,3,4,2)  # B,T,H,W,C → B,T,H,W,C → 不需要额外重塑
-        x_reshaped = x_reshaped.reshape(-1, C, H, W)  # [B*T, C, H, W]
+        x_reshaped = x.permute(0,1,3,4,2)  # B,T,H,W,C → B,T,C,H,W → 不需要额外重塑
+        x_reshaped = x_reshaped.reshape(B*T, C, H, W)  # [B*T, C, H, W]
 
         # 添加尺寸调整（关键步骤）
         x_resized = F.interpolate(
@@ -153,6 +127,8 @@ class TemporalEnhancedNet(nn.Module):
             size=(224, 224),  # 强制调整到ResNet兼容尺寸
             mode='bilinear'
         )
+
+        # with torch.cuda.amp.autocast(enabled=True): 
         spatial_feat = self.spatial_net(x_resized)  # [B*T, 512]
         # _logger.info(spatial_feat)
         spatial_feat = spatial_feat.view(B, T, -1)  # [B, T, 512]
@@ -167,6 +143,8 @@ class TemporalEnhancedNet(nn.Module):
         keys = self.key_head(temporal_feat)        # [B, T, 8]
         mouse = self.mouse_head(temporal_feat)     # [B, T, 2]
         
+        del x,x_reshaped,x_resized,spatial_feat
+
         return torch.cat([keys, mouse], dim=-1)    # [B, T, 10]
 
 # 自定义损失函数
@@ -346,10 +324,29 @@ def run():
     # 初始化配置、模型、数据
     config = Config()
     model = TemporalEnhancedNet()
+
+    dataset_list = Get_Dataset_list("G:\\NN_train\\record_all_0319")
     
-    # 假设已实现Genshin_Basic_Control_Dataset
-    train_dataset, test_dataset, val_dataset = Make_Dataset(config.dataset_path,config.train_rate,config.val_rate)
-    
+    for dataset in dataset_list:
+        # 假设已实现Genshin_Basic_Control_Dataset
+        train_dataset, test_dataset, val_dataset = Make_Dataset(dataset,config.train_rate,config.val_rate)
+        
+        train_loader = Make_Dataloader(train_dataset, batch_size=config.batch_size,shuffle=True,pin_memory=True)
+        val_loader = Make_Dataloader(val_dataset, batch_size=config.batch_size)
+        test_loader = Make_Dataloader(test_dataset,batch_size=config.batch_size)
+        
+        # 训练与评估
+        trained_model = train_model(model, train_loader, val_loader, config)
+        evaluate_model(trained_model, test_loader, config)
+
+
+def _test():
+    config = Config()
+    model = TemporalEnhancedNet()
+
+    full_dataset = Control_Record("G:\\NN_train\\record_all_0319","2025-03-03-12-19-00-255774")
+    train_dataset, test_dataset, val_dataset = Make_Dataset(full_dataset,config.train_rate,config.val_rate)
+
     train_loader = Make_Dataloader(train_dataset, batch_size=config.batch_size,shuffle=True,pin_memory=True)
     val_loader = Make_Dataloader(val_dataset, batch_size=config.batch_size)
     test_loader = Make_Dataloader(test_dataset,batch_size=config.batch_size)
@@ -360,5 +357,6 @@ def run():
 
 # 主程序
 if __name__ == "__main__":
-    run()
+    # run()
+    _test()
     pass

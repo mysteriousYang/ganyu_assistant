@@ -32,6 +32,7 @@ _g_mouse_move_events = []
 _g_mouse_click_events = []
 _g_mouse_scroll_events = []
 _g_frame_count = 1
+_g_key_abort = False
 # _g_debug_flag = False
 
 _key_press_lock = threading.Lock()
@@ -47,7 +48,8 @@ def terminate_capture_check(key):
     if(_C_g_cap_func_key == "ctrl"):
         if any(ctrl in _g_current_keys for ctrl in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
-
+            global _g_key_abort
+            _g_key_abort = True
             _logger.debug(f"Detected Ctrl + {_C_g_cap_key} combination!")
             return False
         else:
@@ -251,6 +253,9 @@ def capture_screen(**kwargs):
                             fout.write(line)
                         _g_mouse_scroll_events.clear()
 
+            # 超过6000帧自动截断
+            if(_g_frame_count >= 6000):
+                break
 
     # 释放资源
     out.release()
@@ -264,7 +269,9 @@ def run():
     path = exist_path(CAPTURE_ROOT, date_path())
     _logger.info(f"录制路径: {path}")
 
-    capture_screen(save_path=path,debug=True)
+    global _g_key_abort
+    while not _g_key_abort:
+        capture_screen(save_path=path,debug=True)
     pass
 
 if __name__ == "__main__":
