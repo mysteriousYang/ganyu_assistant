@@ -1,6 +1,6 @@
 #-*- coding: utf-8 -*-
 import gc
-import sys
+import os
 import datetime
 import torch
 import objgraph
@@ -33,18 +33,24 @@ class Config:
     # 训练参数
     batch_size = 1
     lr = 1e-4
-    epochs = 50
+    epochs = 10
+    running_epoch = 0
+    best_val_loss = float('inf')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # 路径配置
     # checkpoint_path = ".\\models\\checkpoints\\" + datetime.datetime.now().strftime('%Y-%m-%d') + ".pth"
-    best_model_path = ".\\models\\checkpoints\\best_model.pth"
+    checkpoint_dir = ""
+    # best_model_path = ".\\models\\checkpoints\\best_model.pth"
     dataset_path = "E:\\User\\Pictures\\yolo_pics\\genshin_train\\capture\\record_all_0319"
 
     def checkpoint_path(self,epoch):
-        checkpoint_path =  ".\\models\\checkpoints\\" + datetime.datetime.now().strftime('%Y-%m-%d') + f"e{epoch}.pth"
+        checkpoint_path =  f"{self.checkpoint_dir}\\" + datetime.datetime.now().strftime('%Y-%m-%d') + f"e{epoch}.pth"
         return checkpoint_path
 
+    def best_model_path(self):
+        best_model_path = f"{self.checkpoint_dir}\\best_model.pth"
+        return best_model_path
 
 # 改进的模型结构
 class TemporalEnhancedNet(nn.Module):
@@ -176,7 +182,6 @@ def train_model(model, train_loader, val_loader, config:Config):
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3)
     criterion = MultiTaskLoss()
-    best_val_loss = float('inf')
     
     for epoch in range(config.epochs):
         # 训练阶段
@@ -211,9 +216,9 @@ def train_model(model, train_loader, val_loader, config:Config):
             torch.cuda.empty_cache()  # 清理GPU缓存
             gc.collect()
 
-            i-=-1
-            if(i%100==0):
-                _logger.info(f"正在迭代 {i}/{len(train_loader)}")
+            # i += 1
+            # if(i%100==0):
+            #     _logger.info(f"正在迭代 {i}/{len(train_loader)}")
             # if(i==50):
             #     _logger.debug("程序已停止")
             #     exit(0)
@@ -255,22 +260,23 @@ def train_model(model, train_loader, val_loader, config:Config):
         # print(f"Epoch {epoch+1}/{config.epochs}")
         # print(f"Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
         
+        config.running_epoch += 1
         # 每10epochs保存
         if (epoch%10==0):
-            torch.save(model.state_dict(), config.checkpoint_path(epoch))
+            torch.save(model.state_dict(), config.checkpoint_path(config.running_epoch))
             _logger.info("模型记录点已保存！")
 
         # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), config.best_model_path)
+        if avg_val_loss < config.best_val_loss:
+            config.best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), config.best_model_path())
             _logger.info("模型已保存！")
     
     return model
 
 # 测试评估
 def evaluate_model(model, test_loader, config:Config):
-    model.load_state_dict(torch.load(config.best_model_path))
+    model.load_state_dict(torch.load(config.best_model_path()))
     model = model.to(config.device)
     model.eval()
     
@@ -306,6 +312,34 @@ def evaluate_model(model, test_loader, config:Config):
     _logger.info(f"Key Press Accuracy: {key_acc:.4f}")
     _logger.info(f"Mouse Position Error: {mouse_error:.2f} pixels")
 
+def create_train_folder(base_path=".\\models\\checkpoints"):
+    # 确保基础目录存在
+    if not os.path.exists(base_path):
+        os.makedirs(base_path)  # 
+
+    # 获取所有以'train_'开头的文件夹
+    existing_folders = [f for f in os.listdir(base_path) 
+                       if os.path.isdir(os.path.join(base_path, f)) and f.startswith("train_")]
+
+    # 提取现有最大编号
+    max_num = -1
+    for folder in existing_folders:
+        try:
+            num = int(folder.split("_")[1])
+            if num > max_num:
+                max_num = num
+        except (IndexError, ValueError):
+            continue  # 跳过名称不规范的文件夹
+
+    # 生成新编号
+    new_num = max_num + 1
+    new_folder = f"train_{new_num}"
+    new_path = os.path.join(base_path, new_folder)
+
+    # 创建新目录
+    os.makedirs(new_path, exist_ok=True)  # 
+    _logger.info(f"创建文件夹: {new_path}")
+    return new_path
 
 def _check_paths():
     '''
@@ -325,6 +359,7 @@ def run():
     config = Config()
     model = TemporalEnhancedNet()
 
+    config.checkpoint_dir = create_train_folder()
     dataset_list = Get_Dataset_list("G:\\NN_train\\record_all_0319")
     
     for dataset in dataset_list:
@@ -357,6 +392,6 @@ def _test():
 
 # 主程序
 if __name__ == "__main__":
-    # run()
-    _test()
+    run()
+    # _test()
     pass

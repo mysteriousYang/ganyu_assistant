@@ -9,6 +9,7 @@ import win32gui
 import win32ui
 import win32con
 import win32api
+import ctypes
 import cv2
 import pygetwindow as gw
 import numpy as np
@@ -48,8 +49,6 @@ def terminate_capture_check(key):
     if(_C_g_cap_func_key == "ctrl"):
         if any(ctrl in _g_current_keys for ctrl in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
-            global _g_key_abort
-            _g_key_abort = True
             _logger.debug(f"Detected Ctrl + {_C_g_cap_key} combination!")
             return False
         else:
@@ -58,7 +57,9 @@ def terminate_capture_check(key):
     elif(_C_g_cap_func_key == "alt"):
         if any(alt in _g_current_keys for alt in [keyboard.Key.alt_l, keyboard.Key.alt_r, keyboard.Key.alt_gr]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
-
+            global _g_key_abort
+            _g_key_abort = True
+            
             _logger.debug(f"Detected Alt + {_C_g_cap_key} combination!")
             return False
         else:
@@ -255,6 +256,9 @@ def capture_screen(**kwargs):
 
             # 超过6000帧自动截断
             if(_g_frame_count >= 6000):
+                _logger.info(f"录像时长大于 6000 帧，已自动截断")
+                _g_frame_count = 0
+                capture_listener.stop()
                 break
 
     # 释放资源
@@ -265,16 +269,50 @@ def capture_screen(**kwargs):
 
     _logger.info(f"录像已保存: {output_video}")
 
-def run():
+def _check_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def _run_capture():
     path = exist_path(CAPTURE_ROOT, date_path())
     _logger.info(f"录制路径: {path}")
 
     global _g_key_abort
+    _g_key_abort = False
     while not _g_key_abort:
         capture_screen(save_path=path,debug=True)
-    pass
+
+
+def _elevate_and_continue():
+    """提升权限并继续执行子进程（管理员窗口）"""
+    try:
+        script_path = sys.argv[0] if hasattr(sys, 'frozen') else __file__
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, f'"{script_path}" --admin', None, 1
+        )
+        _logger.info("已请求管理员权限，VScode进程阻塞")
+        input("按任意键退出")
+        # sys.exit(0)  # 终止VS Code调试进程
+    except Exception as e:
+        _logger.error(f"权限提升失败: {e}")
+        sys.exit(1)
+
+
+def run():
+    # 区分主进程和子进程
+    if "--admin" not in sys.argv:
+        if not _check_admin():
+            _logger.warning("未检测到管理员权限，尝试提升...")
+            _elevate_and_continue()
+        else:
+            _logger.info("已在管理员权限下直接运行")
+            _run_capture()
+    else:
+        _run_capture()  # 子进程直接执行业务逻辑
+    
 
 if __name__ == "__main__":
-
     run()
     pass
