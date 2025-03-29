@@ -5,7 +5,7 @@ import sys
 import logging
 import datetime
 
-LOG_FILE = ".\\logs\\" + datetime.datetime.now().strftime('%Y-%m-%d') + '\\' + datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + ".log"
+LOG_FILE = "E:\\大学\\大四上\\毕设\\ganyu_assistant\\logs\\" + datetime.datetime.now().strftime('%Y-%m-%d') + '\\' + datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S') + ".log"
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
