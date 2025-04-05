@@ -7,12 +7,11 @@ import win32api
 import win32con
 import pyautogui
 from pynput import keyboard, mouse
-from threading import Thread
+from threading import Thread, Lock
 from math import sin, cos, radians
-from utils.logger import get_stream_logger
+from utils.logger import logger
 from capture_tools.video_capture import terminate_capture_check,terminate_capture_press,terminate_capture_release
 
-_logger = get_stream_logger()
 
 # _C_g_end_key = 'p' #用于终止生成的按键
 # _C_g_end_func_key = 'alt' #用于终止生成的控制按键
@@ -106,7 +105,7 @@ def game_mouse_controller(capture_listener):
         # dx = random.randint(-150, 150)
         # dy = random.randint(-100, 100)
         dx = random.randint(CONFIG['mouse']['distance_range'][0],CONFIG['mouse']['distance_range'][1])
-        dy = random.randint(CONFIG['mouse']['distance_range'][0],CONFIG['mouse']['distance_range'][1])
+        dy = random.randint(0.6*CONFIG['mouse']['distance_range'][0], 0.6*CONFIG['mouse']['distance_range'][1])
         # duration = random.uniform(0.3, 1.2)
         duration = random.uniform(CONFIG['mouse']['duration_range'][0], CONFIG['mouse']['duration_range'][1])
         
@@ -159,11 +158,11 @@ def _elevate_and_continue():
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, f'"{script_path}" --admin', None, 1
         )
-        _logger.info("已请求管理员权限，VScode进程阻塞")
+        logger.info("已请求管理员权限，VScode进程阻塞")
         input("按任意键退出")
         # sys.exit(0)  # 终止VS Code调试进程
     except Exception as e:
-        _logger.error(f"权限提升失败: {e}")
+        logger.error(f"权限提升失败: {e}")
         sys.exit(1)
 
 
@@ -175,16 +174,18 @@ def _check_admin():
 
 
 def _generate_seq():
-    _logger.info("五秒后开始生成按键控制序列")
-    time.sleep(5)
+    logger.info("3秒后开始生成按键控制序列")
+    time.sleep(3)
 
     capture_listener = keyboard.Listener(
         on_press=terminate_capture_press,
-        on_release=terminate_capture_release
+        on_release=terminate_capture_release,
+        # suppress=True,
     )
     capture_listener.start()
 
-    _logger.info("现在开始生成")
+    logger.info("现在开始生成")
+    # run_key_controller(capture_listener)
     # 启动按键线程
     for key in ['w', 's', 'a', 'd', 'space']:
         Thread(target=key_simulator, args=(key, capture_listener), daemon=True).start()
@@ -195,16 +196,16 @@ def _generate_seq():
     # 保持主线程运行
     while capture_listener.is_alive():
         time.sleep(1)
-    _logger.info("\n程序已安全退出")
+    logger.info("\n程序已安全退出")
 
 def run():
     # 区分主进程和子进程
     if "--admin" not in sys.argv:
         if not _check_admin():
-            _logger.warning("未检测到管理员权限，尝试提升...")
+            logger.warning("未检测到管理员权限，尝试提升...")
             _elevate_and_continue()
         else:
-            _logger.info("已在管理员权限下直接运行")
+            logger.info("已在管理员权限下直接运行")
             _generate_seq()
     else:
         _generate_seq()  # 子进程直接执行业务逻辑

@@ -2,13 +2,7 @@
 import sys
 import os
 import time
-import datetime
 import threading
-import json
-import win32gui
-import win32ui
-import win32con
-import win32api
 import ctypes
 import cv2
 import pygetwindow as gw
@@ -17,12 +11,13 @@ from ctypes import windll
 from PIL import Image, ImageGrab
 from pynput import keyboard, mouse
 from mss import mss
+from dataset import Record_Info
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 from config import SCREENSHOT_DIR,CAPTURE_ROOT
 from utils.file_utils import exist_path,date_path,now_file_name
-from utils.logger import Enable_Console_Logger,get_stream_logger
+from utils.logger import logger
 
 _C_g_cap_key = 'p' #用于终止录制的按键
 _C_g_cap_func_key = 'alt' #用于终止录制的控制按键
@@ -42,14 +37,13 @@ _mouse_move_lock = threading.Lock()
 _mouse_click_lock = threading.Lock()
 _mouse_scroll_lock = threading.Lock()
 
-_logger = get_stream_logger()
 
 def terminate_capture_check(key):
-    # _logger.debug(_g_current_keys)
+    # logger.debug(_g_current_keys)
     if(_C_g_cap_func_key == "ctrl"):
         if any(ctrl in _g_current_keys for ctrl in [keyboard.Key.ctrl_l, keyboard.Key.ctrl_r]) and \
         keyboard.KeyCode.from_char(_C_g_cap_key) in _g_current_keys:
-            _logger.debug(f"Detected Ctrl + {_C_g_cap_key} combination!")
+            logger.debug(f"Detected Ctrl + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -60,7 +54,7 @@ def terminate_capture_check(key):
             global _g_key_abort
             _g_key_abort = True
             
-            _logger.debug(f"Detected Alt + {_C_g_cap_key} combination!")
+            logger.debug(f"Detected Alt + {_C_g_cap_key} combination!")
             return False
         else:
             return True
@@ -214,19 +208,19 @@ def capture_screen(**kwargs):
                 with open(output_csv,mode="a",encoding="utf-8") as fout:
                     
                     if not _g_key_press_events.__len__() == 0:
-                        _logger.debug(_g_key_press_events)
+                        logger.debug(_g_key_press_events)
 
                     if not _g_key_release_events.__len__() == 0:
-                        _logger.debug(_g_key_release_events)
+                        logger.debug(_g_key_release_events)
 
                     if not _g_mouse_move_events.__len__() == 0:
-                        _logger.debug(_g_mouse_move_events)
+                        logger.debug(_g_mouse_move_events)
 
                     if not _g_mouse_click_events.__len__() == 0:
-                        _logger.debug(_g_mouse_click_events)
+                        logger.debug(_g_mouse_click_events)
 
                     if not _g_mouse_scroll_events.__len__() == 0:
-                        _logger.debug(_g_mouse_scroll_events)
+                        logger.debug(_g_mouse_scroll_events)
 
 
                     with _key_press_lock:
@@ -256,7 +250,7 @@ def capture_screen(**kwargs):
 
             # 超过6000帧自动截断
             if(_g_frame_count >= 6000):
-                _logger.info(f"录像时长大于 6000 帧，已自动截断")
+                logger.info(f"录像时长大于 6000 帧，已自动截断")
                 _g_frame_count = 0
                 capture_listener.stop()
                 break
@@ -267,7 +261,7 @@ def capture_screen(**kwargs):
     mouse_listener.stop()
     cv2.destroyAllWindows()
 
-    _logger.info(f"录像已保存: {output_video}")
+    logger.info(f"录像已保存: {output_video}")
 
 def _check_admin():
     try:
@@ -277,7 +271,10 @@ def _check_admin():
 
 def _run_capture():
     path = exist_path(CAPTURE_ROOT, date_path())
-    _logger.info(f"录制路径: {path}")
+    logger.info(f"录制路径: {path}")
+
+    logger.info("10秒后开始录制")
+    time.sleep(10)
 
     global _g_key_abort
     _g_key_abort = False
@@ -292,11 +289,11 @@ def _elevate_and_continue():
         ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, f'"{script_path}" --admin', None, 1
         )
-        _logger.info("已请求管理员权限，VScode进程阻塞")
+        logger.info("已请求管理员权限，VScode进程阻塞")
         input("按任意键退出")
         # sys.exit(0)  # 终止VS Code调试进程
     except Exception as e:
-        _logger.error(f"权限提升失败: {e}")
+        logger.error(f"权限提升失败: {e}")
         sys.exit(1)
 
 
@@ -304,10 +301,10 @@ def run():
     # 区分主进程和子进程
     if "--admin" not in sys.argv:
         if not _check_admin():
-            _logger.warning("未检测到管理员权限，尝试提升...")
+            logger.warning("未检测到管理员权限，尝试提升...")
             _elevate_and_continue()
         else:
-            _logger.info("已在管理员权限下直接运行")
+            logger.info("已在管理员权限下直接运行")
             _run_capture()
     else:
         _run_capture()  # 子进程直接执行业务逻辑

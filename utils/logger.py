@@ -76,3 +76,5 @@ def get_stream_logger():
         __logger = logger
 
     return __logger
+
+logger = get_stream_logger()

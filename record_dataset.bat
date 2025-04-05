@@ -15,8 +15,8 @@ if %errorlevel% neq 0 (
 )
 
 REM 并发执行
-start "进程1" cmd /c "python "%SCRIPT1%" --admin && echo 脚本1执行成功 || echo 脚本1执行失败"
-start "进程2" cmd /c "python "%SCRIPT2%" --admin && echo 脚本2执行成功 || echo 脚本2执行失败"
+start "simulate_ctrl" cmd /c "python "%SCRIPT1%" --admin && echo 脚本1执行成功 || echo 脚本1执行失败"
+start "video_capture" cmd /c "python "%SCRIPT2%" --admin && echo 脚本2执行成功 || echo 脚本2执行失败"
 
 REM 监控窗口（可选）
 tasklist /fi "imagename eq python.exe"

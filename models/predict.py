@@ -1,20 +1,27 @@
 #-*- coding: utf-8 -*-
 import cv2
 import torch
+import sys
+import os
 import numpy as np
+
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(parent_dir)
+
 from torchvision import transforms
 from tqdm import tqdm
-from model import TemporalEnhancedNet  # 假设已定义时序模型
-from utils.logger import get_stream_logger
+# from models.model_design0 import TemporalEnhancedNet  # 假设已定义时序模型
+from models.model_claude_2 import GameInputPredictor
+from utils.logger import logger
 
-_logger = get_stream_logger()
+debug_flow_out = cv2.VideoWriter(f".\\video\\output_flow.mp4", cv2.VideoWriter_fourcc(*'mp4v'), 20, (480, 272))
 
 class VideoOperatorRecognizer:
     def __init__(self, model_path, input_size=(272, 480), time_steps=100):
         # 初始化参数
         self.time_steps = time_steps
         self.input_size = input_size
-        self.screen_res = (1920, 1080)
+        self.screen_res = (1080, 1920)
         
         # 模型加载
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -25,17 +32,27 @@ class VideoOperatorRecognizer:
         # 初始化CUDA光流计算器（以DualTVL1算法为例）
         if cv2.cuda.getCudaEnabledDeviceCount() > 0:
             # 使用CUDA加速的光流算法
-            _logger.info(f"检测到CUDA设备，使用GPU计算光流")
-            self.flow_calculator = cv2.cuda_OpticalFlowDual_TVL1.create(
-                tau=0.25, 
-                lambda_=0.15, 
-                theta=0.3, 
-                nscales=5, 
-                warps=5
-            )
+            logger.info(f"检测到CUDA设备，使用GPU计算光流")
+            # self.flow_calculator = cv2.cuda_OpticalFlowDual_TVL1.create(
+            #     tau=0.25, 
+            #     lambda_=0.15, 
+            #     theta=0.3, 
+            #     nscales=5, 
+            #     warps=5
+            # )
+            self.flow_calculator = cv2.cuda_FarnebackOpticalFlow.create(
+            numLevels=5,      # 金字塔层数
+            pyrScale=0.5,     # 金字塔缩放比例
+            fastPyramids=False,
+            winSize=15,       # 窗口大小
+            numIters=3,       # 迭代次数
+            polyN=5,          # 多项式大小
+            polySigma=1.2,    # 多项式标准差
+            flags=0           # 标志位
+        )
             self.cv_device = "cuda"
         else:
-            _logger.info(f"未检测到CUDA设备，使用GPU计算")
+            logger.info(f"未检测到CUDA设备，使用GPU计算")
             self.flow_calculator = cv2.optflow.DualTVL1OpticalFlow_create()
             self.cv_device = "cpu"
         
@@ -56,10 +73,11 @@ class VideoOperatorRecognizer:
 
     def _load_model(self, model_path):
         # 示例模型结构，需替换为实际模型
-        _logger.debug(f"正在加载模型 {model_path}")
+        logger.debug(f"正在加载模型 {model_path}")
         # model = torch.nn.LSTM(input_size=480*272*6, hidden_size=512, num_layers=2).to(self.device)
-        model = TemporalEnhancedNet()
-        model.load_state_dict(torch.load(model_path))
+        # model = TemporalEnhancedNet()
+        model = GameInputPredictor()
+        model.load_state_dict(torch.load(model_path,weights_only=True))
         model = model.to(self.device)
         model.eval()
         return model
@@ -93,13 +111,27 @@ class VideoOperatorRecognizer:
         # CUDA光流计算
         gpu_flow = self.flow_calculator.calc(gpu_prev, gpu_curr, None)
         flow = gpu_flow.download()  # 下载到CPU
+
+        magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+        # 将光流可视化
+        hsv = np.zeros((self.input_size[0], self.input_size[1], 3), dtype=np.uint8)
+        hsv[..., 0] = angle * 180 / np.pi / 2  # 色调
+        hsv[..., 1] = 255                      # 饱和度
+        hsv[..., 2] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)  # 亮度
+        flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        # flow_img /= np.float32(255.0)
+        debug_flow_out.write(flow_img)
+        # logger.debug(flow_img.shape)
+
+        return flow_img
         
-        # 将光流分解为X/Y方向并归一化
-        flow_x = cv2.normalize(flow[..., 0], None, 0, 255, cv2.NORM_MINMAX)
-        flow_y = cv2.normalize(flow[..., 1], None, 0, 255, cv2.NORM_MINMAX)
-        flow_mag = cv2.magnitude(flow_x, flow_y)
+        # # 将光流分解为X/Y方向并归一化
+        # flow_x = cv2.normalize(flow[..., 0], None, 0, 255, cv2.NORM_MINMAX)
+        # flow_y = cv2.normalize(flow[..., 1], None, 0, 255, cv2.NORM_MINMAX)
+        # flow_mag = cv2.magnitude(flow_x, flow_y)
     
-        return np.stack([flow_x, flow_y, flow_mag], axis=2).astype(np.uint8)
+        # return np.stack([flow_x, flow_y, flow_mag], axis=2).astype(np.uint8)
 
     def _buffer_to_input(self):
         # 填充对齐处理（光流比RGB少1帧）
@@ -108,9 +140,12 @@ class VideoOperatorRecognizer:
         
         # 合并数据
         combined = []
-        for rgb, flow in zip(self.rgb_buffer, self.flow_buffer):
-            combined_frame = np.concatenate([rgb, flow], axis=2)  # [H,W,6]
-            combined.append(self.transform(combined_frame))
+        # for rgb, flow in zip(self.rgb_buffer, self.flow_buffer):
+        #     combined_frame = np.concatenate([rgb, flow], axis=2)  # [H,W,6]
+        #     combined.append(self.transform(combined_frame))
+
+        for flow in self.flow_buffer:
+            combined.append(self.transform(flow))
 
         return torch.stack(combined).unsqueeze(0).to(self.device)  # [1,T,C,H,W]
     # def _buffer_to_input(self):
@@ -134,30 +169,31 @@ class VideoOperatorRecognizer:
 
     def _decode_actions(self, outputs):
         # 转换为操作序列
-        # _logger.debug(f"正在转化操作序列")
-        key_labels = ['W', 'S', 'A', 'D', 'Shift', 'Ctrl', 'Space', 'X']
+        # logger.debug(f"正在转化操作序列")
+        key_labels = ['W', 'S', 'A', 'D', 'Space',]
         actions = []
         for t in range(outputs.shape[1]):
             action = outputs[0, t].cpu().numpy()
             # 按键状态
-            keys = [action[i] > 0.5 for i in range(8)]
+            keys = [action[i] > 0.5 for i in range(len(key_labels))]
             # 鼠标坐标
-            mouse_x = int(action[8] * self.screen_res[0])
-            mouse_y = int(action[9] * self.screen_res[1])
+            mouse_x = int(action[len(key_labels)] * self.screen_res[1]) + 960
+            mouse_y = int(action[len(key_labels)+1] * self.screen_res[0]) + 540
             actions.append({
                 'keys': {k: v for k, v in zip(key_labels, keys)},
                 'mouse': (mouse_x, mouse_y)
             })
-        # _logger.debug(actions)
+        # logger.debug(actions)
         return actions
 
     def _render_overlay(self, frame, action):
         # 鼠标光标
-        cv2.circle(frame, action['mouse'], 8, (0,255,0), -1)
+        cv2.circle(frame, action['mouse'], 8, (0,0,255), -1)
         # 按键状态
         active_keys = [k for k, v in action['keys'].items() if v]
         text = "Pressed: " + ", ".join(active_keys) if active_keys else "No Keys"
-        cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+        cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+        cv2.putText(frame, f"mouse_x: {action["mouse"][0]}, mouse_y: {action["mouse"][1]}", (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
         return frame
 
     def process_video(self, input_path, output_path):
@@ -172,17 +208,17 @@ class VideoOperatorRecognizer:
         # 光流计算初始化
         prev_gray = None
         
-        with tqdm(total=total_frames, desc="Processing Video") as pbar:
+        with tqdm(total=total_frames, desc="预测并渲染") as pbar:
             j=0
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret: 
-                    # _logger.debug(f"视频处理完毕，退出循环")
+                    # logger.debug(f"视频处理完毕，退出循环")
                     # pbar.close()
                     break
                 j-=-1
                 if(j > total_frames):
-                    # _logger.debug(f"视频处理完毕，退出循环")
+                    # logger.debug(f"视频处理完毕，退出循环")
                     # pbar.close()
                     break
 
@@ -193,14 +229,16 @@ class VideoOperatorRecognizer:
                 # 计算光流
                 if prev_gray is not None:
                     flow = self._compute_flow(prev_gray, gray)
+                
                     self.flow_buffer.append(flow)
+            
                 prev_gray = gray
                 
                 # 存储RGB帧
                 self.rgb_buffer.append(cv2.cvtColor(resized_frame, cv2.COLOR_BGR2RGB))
                 
                 # 达到时间窗口后推理
-                # _logger.debug(f"正在推理")
+                # logger.debug(f"正在推理")
                 if len(self.rgb_buffer) == self.time_steps:
                     # 构造模型输入
                     inputs = self._buffer_to_input()
@@ -208,7 +246,7 @@ class VideoOperatorRecognizer:
                     # 模型推理
                     with torch.no_grad():
                         outputs = self.model(inputs)
-                    
+                        # logger.debug(outputs)
                     # 解码操作序列
                     actions = self._decode_actions(outputs)
                     
@@ -218,7 +256,7 @@ class VideoOperatorRecognizer:
                         cap.set(cv2.CAP_PROP_POS_FRAMES, j - self.time_steps + i)
                         _, render_frame = cap.read()
                         render_frame = self._render_overlay(render_frame, actions[i])
-                        # _logger.debug(f"正在转存第 {j - self.time_steps + i} 帧")
+                        # logger.debug(f"正在转存第 {j - self.time_steps + i} 帧")
                         out.write(render_frame)
                     
                     # 清空缓冲区
@@ -226,7 +264,7 @@ class VideoOperatorRecognizer:
                     self.flow_buffer = []
                     
                 pbar.update(1)
-            _logger.info(f"已完成所有帧的处理")
+        logger.info(f"已完成所有帧的预测")
         
         # 处理剩余帧
         # if len(self.rgb_buffer) > 0:
@@ -241,10 +279,11 @@ class VideoOperatorRecognizer:
         
         cap.release()
         out.release()
+        debug_flow_out.release()
 
 def run():
-    recognizer = VideoOperatorRecognizer(".\\models\\checkpoints\\train_3\\best_model.pth")
-    recognizer.process_video(".\\input_s.mp4", ".\\video\\output.mp4")
+    recognizer = VideoOperatorRecognizer(r"models\checkpoints\2025-04-03\train_9\best_model.pth",time_steps=4)
+    recognizer.process_video(".\\video\\input_s.mp4", ".\\video\\output_0403.mp4")
     pass
 
 # 使用示例

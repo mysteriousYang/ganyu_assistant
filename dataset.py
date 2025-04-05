@@ -1,29 +1,79 @@
 #-*- coding: utf-8 -*-
 import os
 import json
-import logging
-import math
 import cv2
 import torch.nn
 import argparse
-import queue
 import gc
-import subprocess
 
 import numpy as np
 
 from memory_profiler import profile
+from tqdm import tqdm
 from typing import List
 from RAFT.raft import RAFT
 from RAFT.utils import flow_viz
 from torch.utils.data import Dataset
 from moviepy.editor import VideoFileClip
 from pathlib import Path
-from utils.logger import get_stream_logger,timer_logger
+from utils.logger import logger,timer_logger
+from config import Dataset_Config
 
-_logger = get_stream_logger()
 
-class Control_Record():
+class Record_Info:
+    def __init__(self, record_dir, record):
+        self.record = record
+        self.record_dir = record_dir
+
+        self.info_file = os.path.join(self.record_dir,f"{self.record}_info.json")
+        self.data = None
+        pass
+
+    def __getitem__(self,key):
+        self._load()
+        return self.data[key]
+    
+    def __contains__(self,key):
+        self._load()
+        result = key in self.data
+        self.data = None
+        return result
+
+    def __setitem__(self,key,value):
+        self._load()
+        self.data[key] = value
+        self._flush()
+        pass
+
+    def __str__(self,):
+        self._load()
+        result = str(self.data)
+        self.data = None
+        return result
+
+    def _touch(self):
+        with open(self.info_file,mode='w',encoding="utf-8") as fp:
+            fp.write("{}")
+
+
+    def _flush(self):
+        with open(self.info_file,mode='w',encoding='utf-8') as fp:
+            json.dump(self.data,fp)
+        self.data = None
+
+    def _load(self):
+        if not (os.path.exists(self.info_file)):
+            self._touch()
+
+        if self.data is None:
+            with open(self.info_file,mode='r',encoding="utf-8") as fp:
+                self.data = json.load(fp)
+        else:
+            return
+
+
+
+class Control_Record(Dataset):
     '''
     描述控制录像的类
 
@@ -36,20 +86,21 @@ class Control_Record():
         self.record_dir = record_dir
         self.clip_in_ram = False
 
-        self.raw_clip_file = os.path.join(self.record_dir,f"{self.record}.mp4")
-        self.raw_clip_file_S = os.path.join(self.record_dir,f"{self.record}_s.mp4")
-        self.flow_clip_file = os.path.join(self.record_dir,f"{self.record}_flow.mp4")
-        self.flow_clip_file_S = os.path.join(self.record_dir,f"{self.record}_s_flow.mp4")
+        self.raw_clip_file = os.path.join(self.record_dir,f"{self.record}.{Dataset_Config.video_suffix}")
+        self.raw_clip_file_S = os.path.join(self.record_dir,f"{self.record}_s.{Dataset_Config.video_suffix}")
+        self.flow_clip_file = os.path.join(self.record_dir,f"{self.record}_flow.{Dataset_Config.flow_video_suffix}i")
+        self.flow_clip_file_S = os.path.join(self.record_dir,f"{self.record}_s_flow.{Dataset_Config.flow_video_suffix}")
         self.kb_file = os.path.join(self.record_dir,f"{self.record}.kb")
         self.ms_file = os.path.join(self.record_dir,f"{self.record}.ms")
         self.kb_np_file = os.path.join(self.record_dir,f"{self.record}_kb.npy")
         self.ms_np_file = os.path.join(self.record_dir,f"{self.record}_ms.npy")
 
         # 读取视频信息
-        self.info_file = os.path.join(self.record_dir,f"{self.record}_info.json")
-        with open(self.info_file,mode="r") as json_in:
-            self.info = json.load(json_in)
-            _logger.debug(f"{self.record}: 成功读取录像信息")
+        # self.info_file = os.path.join(self.record_dir,f"{self.record}_info.json")
+        # with open(self.info_file,mode="r") as json_in:
+        #     self.info = json.load(json_in)
+        #     logger.debug(f"{self.record}: 成功读取录像信息")
+        self.info = Record_Info(record_dir,record)
 
         self.video_obj = None
         self.X_mapfile = os.path.join(self.record_dir,f"{self.record}_X.memmap")
@@ -60,22 +111,21 @@ class Control_Record():
         # self.make_control_seq()
         self.process_records()
 
-        self.TOTAL_ROWS = self.X.shape[0]
+        # self.TOTAL_ROWS = self.X.shape[0]
 
-        _logger.debug(f"{self.record}: 对象构造完成 {repr(self)}")
+        logger.debug(f"{self.record}: 对象构造完成 {repr(self)}")
 
     def __len__(self):
-        return self.BLOCK_COUNT
+        return self.info["block_count"] - 1
     
     def __repr__(self):
-        return f"Rec {self.record}"
+        return f"<Rec {self.record}>"
 
     def __getitem__(self, idx):
         """
         根据索引返回一个数据样本
         :param index: 索引
-        """
-        """
+
         按索引获取数据。
 
         参数:
@@ -139,9 +189,10 @@ class Control_Record():
         # 遍历按下与释放的帧对
         for press, release in zip(press_frames, release_frames):
             if press < release:
+                # logger.debug(f"{press}:{release} = true")
                 key_status[press:release + 1] = 1.0  # 按下到释放之间的帧标记为1
             else:
-                _logger.warning(f"{repr(self)}: 警告：按下帧 {press} 大于释放帧 {release}，跳过该对")
+                logger.warning(f"{repr(self)}: 警告：按下帧 {press} 大于释放帧 {release}，跳过该对")
         
         return key_status
 
@@ -167,20 +218,28 @@ class Control_Record():
         """
 
         # 初始化全零数组
-        key_status = np.zeros((self.info["total_frames"],8), dtype=np.float32)
-        key_events = {
-            # ( [press], [release] )
-            "12":([],[]),    # W
-            "22":([],[]),    # S
-            "21":([],[]),    # A
-            "23":([],[]),    # D
-            "100":([],[]),   # shift
-            "101":([],[]),   # ctrl
-            "109":([],[]),   # space
-            "31":([],[]),    # X
-        }
+        # (行，列) = (总帧数，需要学习的按键数量)
+        key_status = np.zeros((self.info["total_frames"],len(Dataset_Config.learn_keys)), dtype=np.float32)
 
-        _logger.debug(f"{self.record}: 正在填充按键数据")
+        key_events = dict()
+        with open(".\\key_mapping.json",mode='r',encoding="utf-8") as km_fp:
+            key_map = json.load(km_fp)
+        for key in Dataset_Config.learn_keys:
+            key_events[ str(key_map[key]) ] = ([], [])
+        # logger.debug(key_events)
+        # key_events = {
+        #     # ( [press], [release] )
+        #     "12":([],[]),    # W
+        #     "22":([],[]),    # S
+        #     "21":([],[]),    # A
+        #     "23":([],[]),    # D
+        #     "100":([],[]),   # shift
+        #     "101":([],[]),   # ctrl
+        #     "109":([],[]),   # space
+        #     "31":([],[]),    # X
+        # }
+
+        logger.debug(f"{self.record}: 正在填充按键数据")
         with open(self.kb_file,mode='r',encoding="utf-8") as fp:
             while True:
                 # 字段结构
@@ -200,47 +259,55 @@ class Control_Record():
         for i, (key, (press_frames, release_frames)) in enumerate(key_events.items()):
             # 注意i是从1开始
             key_status[:, i - 1] = self._fill_key_press_status(press_frames, release_frames)
-    
+
+        # for line in key_status:
+        #     logger.debug(line)
         return key_status
 
-    def make_control_seq(self,block_size=100):
+    def make_control_seq(self,block_size=Dataset_Config.BLOCK_SIZE):
 
         self.BLOCK_SIZE = block_size
         self.kb_event = self.fill_key_press()
 
         # keyboard
         # 计算需要填充的帧数
-        _logger.debug(f"{self.record}: 正在构建键盘数据块")
+        logger.debug(f"{self.record}: 正在构建键盘数据块")
         remainder = self.info["total_frames"] % self.BLOCK_SIZE
-        if remainder != 0:
-            padding_size = self.BLOCK_SIZE - remainder
-            kb_data = np.pad(self.kb_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
-
+        # if remainder != 0:
+        padding_size = self.BLOCK_SIZE - remainder
+        kb_data = np.pad(self.kb_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
+        # else:
+            # kb_data = self.kb_event
         # 切分为 (x, self.BLOCK_SIZE, 8) 的三维数组
         x = kb_data.shape[0] // self.BLOCK_SIZE
-        self.kb_block = kb_data.reshape(x, self.BLOCK_SIZE, 8)
+        self.kb_block = kb_data.reshape(x, self.BLOCK_SIZE, len(Dataset_Config.learn_keys))
 
         # 保存键盘数组
         np.save(self.kb_np_file,self.kb_block)
         
         # mouse
-        _logger.debug(f"{self.record}: 正在构建鼠标数据块")
+        logger.debug(f"{self.record}: 正在构建鼠标数据块")
         block_count = (self.info["total_frames"]+padding_size) // self.BLOCK_SIZE
         self.ms_block = np.zeros((block_count, self.BLOCK_SIZE, 2), dtype=np.float32)
+        self.info["block_count"] = block_count
+        self.BLOCK_COUNT = block_count
 
         ms_events = np.loadtxt(self.ms_file,dtype=np.int16,delimiter='\t')
         line_count = 0
-        for _, x, y, frame_number in ms_events:
-            x /= self.info["original_width"]
-            y /= self.info["original_height"]
 
-            self.ms_block[int(frame_number//self.BLOCK_SIZE)][int(frame_number%self.BLOCK_SIZE)] = [x,y]
+        with tqdm(total=len(ms_events), desc="处理鼠标数据") as pbar:
+            for _, x, y, frame_number in ms_events:
+                x /= self.info["original_width"]
+                y /= self.info["original_height"]
 
-            line_count-=-1
-            # if(line_count%1000 == 0):
-            #     _logger.debug(f"Processing line {line_count}")
+                self.ms_block[int(frame_number//self.BLOCK_SIZE)][int(frame_number%self.BLOCK_SIZE)] = [x,y]
 
-        self.BLOCK_COUNT = self.ms_block.shape[0]
+                line_count-=-1
+                # if(line_count%1000 == 0):
+                #     logger.debug(f"Processing line {line_count}")
+                pbar.update(1)
+
+        # self.BLOCK_COUNT = self.ms_block.shape[0]
 
         # 保存鼠标数组
         np.save(self.ms_np_file,self.ms_block)
@@ -266,22 +333,22 @@ class Control_Record():
         #             self.ms_block[int(frame_number//self.BLOCK_SIZE)][int(frame_number%self.BLOCK_SIZE)] = [x,y]
         #         except OverflowError:
         #             # 可能会出现坐标值小于0的情况，原因暂时未知
-        #             _logger.error(f"{repr(self)}: 帧 {frame_number} 错误的位置值({x},{y})")
+        #             logger.error(f"{repr(self)}: 帧 {frame_number} 错误的位置值({x},{y})")
                 
         #         line_count-=-1
         #         if(line_count%1000 == 0):
-        #             _logger.debug(f"Processing line {line_count}")
+        #             logger.debug(f"Processing line {line_count}")
         #         del x,y,frame_number
         #         gc.collect()
         # 计算需要填充的帧数
-        # _logger.debug(f"{self.record}: 正在填充鼠标数据块")
+        # logger.debug(f"{self.record}: 正在填充鼠标数据块")
         # if remainder != 0:
         #     padding_size = self.BLOCK_SIZE - remainder
         #     # ms_data = np.pad(self.ms_event, ((0, padding_size), (0, 0)), mode="constant")  # 填充0
         #     zeros_array = np.zeros(shape=(padding_size, 2), dtype=np.float32)
         #     ms_data = np.concatenate([self.ms_event, zeros_array], axis=0)
         # x = self.ms_event.shape[0] // self.BLOCK_SIZE
-        # _logger.debug(f"正在重整数组")
+        # logger.debug(f"正在重整数组")
         # self.ms_block = self.ms_event.reshape(x, self.BLOCK_SIZE, 2)
         # del ms_data,zeros_array
 
@@ -343,7 +410,7 @@ class Control_Record():
         self.clip_in_ram = False
         gc.collect()
 
-        _logger.debug(f"{self.record} : 已清理")
+        logger.debug(f"{self.record} : 已清理")
 
     def load_clip_from_disk(self,use_large=False):
         if(self.clip_in_ram):
@@ -382,7 +449,7 @@ class Control_Record():
             self.raw_clip_frames.append(raw_frame)
             self.flow_clip_frames.append(flow_frame)
 
-        # _logger.info(self.raw_clip_frames)
+        # logger.info(self.raw_clip_frames)
 
         # self.raw_clip_frames = np.array(self.raw_clip_frames,dtype=np.uint8)
         # self.flow_clip_frames = np.array(self.flow_clip_frames,dtype=np.uint8)
@@ -393,7 +460,7 @@ class Control_Record():
         self.raw_clip_frames = np.array(self.raw_clip_frames, dtype=np.float32) / 255.0
         self.flow_clip_frames = np.array(self.flow_clip_frames, dtype=np.float32) / 255.0
 
-        # _logger.debug(self.raw_clip_frames.shape)
+        # logger.debug(self.raw_clip_frames.shape)
 
         remainder = self.info["total_frames"] % self.BLOCK_SIZE
         if remainder == 0:
@@ -405,14 +472,87 @@ class Control_Record():
         padding_shape = (padding_size,) + self.raw_clip_frames.shape[1:]
         padding_frames = np.full(padding_shape, 0, dtype=np.float32)
 
-        # _logger.debug(self.raw_clip_frames.shape)
-        # _logger.debug(padding_frames.shape)
+        # logger.debug(self.raw_clip_frames.shape)
+        # logger.debug(padding_frames.shape)
 
         # 合并原始帧和填充帧
         self.raw_clip_frames = np.concatenate([self.raw_clip_frames, padding_frames], axis=0)
         self.flow_clip_frames = np.concatenate([self.flow_clip_frames, padding_frames], axis=0)
 
         self.clip_in_ram = True
+
+    def _dump_clip_frames(self,use_large=False):
+        # load 
+        if(self.video_obj is None):
+            self.video_obj = dict()
+
+        if("flag_raw_S" in self.info):
+            self.video_obj["raw_S"] = cv2.VideoCapture(self.raw_clip_file_S)
+        if("flag_flow_S" in self.info):
+            self.video_obj["flow_S"] = cv2.VideoCapture(self.flow_clip_file_S)
+        if(use_large and "flag_raw" in self.info):
+            self.video_obj["raw"] = cv2.VideoCapture(self.raw_clip_file)
+        if(use_large and "flag_flow" in self.info):
+            self.video_obj["flow"] = cv2.VideoCapture(self.flow_clip_file)
+        
+        if(use_large):
+            raw_video_reader = self.video_obj["raw"]
+            flow_video_reader = self.video_obj["flow"]
+        else:
+            raw_video_reader = self.video_obj["raw_S"]
+            flow_video_reader = self.video_obj["flow_S"]
+
+        flow_frame_list = list()
+
+        with tqdm(total=self.info["block_count"], desc="处理视频数据") as pbar:
+            _EOF_FLAG = False
+            block_count = 0
+            while not _EOF_FLAG:
+                for i in range(Dataset_Config.BLOCK_SIZE):
+                    ret, flow_frame = flow_video_reader.read()
+
+                    if not ret:
+                        flow_frame_list.append(flow_frame_list[-1])
+                        _EOF_FLAG = True
+                    else:
+                        flow_frame = flow_frame.astype("float32")
+                        flow_frame /= np.float32(255.0)
+                        flow_frame_list.append(flow_frame)
+                
+
+                X_append = np.array(flow_frame_list, dtype=np.float32)
+                X_append = X_append[np.newaxis, ...]
+                flow_frame_list.clear()
+
+                self.X = self._create_or_extend_memmap(self.X_mapfile, np.float32, X_append.shape)
+                self.X[-1] = X_append
+                self.X.flush()
+                block_count += 1
+                # logger.debug(self.X.shape)
+                # self.raw_clip_frames.append(raw_frame)
+                # self.flow_clip_frames.append(flow_frame)
+                pbar.update(1)
+        logger.debug(self.X.shape)
+        pass
+
+    def _dump_ctrl_block(self):
+        with tqdm(total=len(self), desc="处理标签数据") as pbar:
+            for j in range(len(self)):
+                kb_block, ms_block = self.get_block(j)
+                Y_append = np.concatenate([kb_block, ms_block], axis=-1)
+                Y_append = Y_append[np.newaxis, ...]
+                # logger.debug(X_append.shape)
+                # logger.debug(Y_append.shape)
+
+
+                self.Y = self._create_or_extend_memmap(self.Y_mapfile,np.float32,Y_append.shape)
+                self.Y[-1] = Y_append
+                self.Y.flush()
+
+                # logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
+                # logger.debug(self.X.shape)
+                # logger.debug(self.Y.shape)
+                pbar.update(1)
 
     def _create_or_extend_memmap(self, file_path, dtype, shape, mode="r+"):
         """
@@ -445,8 +585,8 @@ class Control_Record():
             existing_memmap = existing_memmap.reshape((num_frames,) + shape[1:])
             # existing_memmap = existing_memmap.reshape((now_blocks,self.BLOCK_SIZE) + shape[1:])
 
-            # _logger.debug(existing_memmap.shape)
-            # _logger.debug(shape)
+            # logger.debug(existing_memmap.shape)
+            # logger.debug(shape)
             new_shape = (existing_memmap.shape[0] + shape[0],) + existing_memmap.shape[1:]
             memmap = np.memmap(file_path, dtype=dtype, mode=mode, shape=new_shape)
         else:
@@ -455,31 +595,35 @@ class Control_Record():
         return memmap
     
     def _load_memmap_fp(self):
-        with open(self.info_file,mode="r",encoding="utf-8") as fp:
-            memmap_info = json.load(fp)
-            self.X = np.memmap(self.X_mapfile, dtype=np.float32, mode="r", shape=memmap_info["X_shape"])
-            self.Y = np.memmap(self.Y_mapfile, dtype=np.float32, mode="r", shape=memmap_info["Y_shape"])
+        # with open(self.info_file,mode="r",encoding="utf-8") as fp:
+        #     memmap_info = json.load(fp)
+        #     self.X = np.memmap(self.X_mapfile, dtype=np.float32, mode="r", shape=memmap_info["X_shape"])
+        #     self.Y = np.memmap(self.Y_mapfile, dtype=np.float32, mode="r", shape=memmap_info["Y_shape"])
+        self.X = np.memmap(self.X_mapfile, dtype=np.float32, mode="r", shape=self.info["X_shape"])
+        self.Y = np.memmap(self.Y_mapfile, dtype=np.float32, mode="r", shape=self.info["Y_shape"])
 
-    def process_records(self,block_size=100):
+    def process_records(self,block_size=Dataset_Config.BLOCK_SIZE):
         """
         将类中的records转化为可供使用的数据集
         """
         self.BLOCK_SIZE = block_size
 
         if(os.path.exists(self.X_mapfile) and os.path.exists(self.Y_mapfile)):
-            _logger.info(f"{repr(self)}: 数据集已存在，直接读取")
+            logger.info(f"{repr(self)}: 数据集已存在，直接读取")
             self._load_memmap_fp()
-            self.BLOCK_COUNT = self.info["X_shape"][0]
+            self.BLOCK_COUNT = self.info["block_count"]
             return
         
         if(os.path.exists(self.kb_np_file) and os.path.exists(self.ms_np_file)):
-            _logger.info(f"{repr(self)}: x和y已存在，直接读取")
+            logger.info(f"{repr(self)}: x和y已存在，直接读取")
             self.kb_block = np.load(self.kb_np_file)
             self.ms_block = np.load(self.ms_np_file)
             self.BLOCK_COUNT = len(self.kb_block)
         else:
             self.make_control_seq(block_size)
         
+        self._dump_ctrl_block()
+        self._dump_clip_frames()
         # process_info = dict()
         # self._rec_offset = dict() # 用于记录每个录像文件对应的offset
         # offset = 0
@@ -487,46 +631,48 @@ class Control_Record():
         # self._rec_offset[self.record] = offset
         # offset += self.info["total_frames"]
 
-        _logger.debug(f"正在处理视频数据")
-        for j in range(len(self)):
-            kb_block, ms_block = self.get_block(j)
-            raw_frames, flow_frames = self.get_frame_range(j*self.BLOCK_SIZE,(j+1)*self.BLOCK_SIZE)
+        # logger.debug(f"正在处理视频数据")
+        # with tqdm(total=len(self), desc="处理视频数据") as pbar:
+        #     for j in range(len(self)):
+        #         kb_block, ms_block = self.get_block(j)
+        #         raw_frames, flow_frames = self.get_frame_range(j*self.BLOCK_SIZE,(j+1)*self.BLOCK_SIZE)
 
-            X_append = np.concatenate([raw_frames, flow_frames], axis=-1)
-            Y_append = np.concatenate([kb_block, ms_block], axis=-1)
+        #         X_append = np.concatenate([raw_frames, flow_frames], axis=-1)
+        #         Y_append = np.concatenate([kb_block, ms_block], axis=-1)
 
-            # _logger.debug(X_append.shape)
-            # _logger.debug(Y_append.shape)
+        #         # logger.debug(X_append.shape)
+        #         # logger.debug(Y_append.shape)
 
-            self.X = self._create_or_extend_memmap(self.X_mapfile,np.float32,X_append.shape)
-            self.X[-X_append.shape[0]:] = X_append
-            self.X.flush()
+        #         self.X = self._create_or_extend_memmap(self.X_mapfile,np.float32,X_append.shape)
+        #         self.X[-X_append.shape[0]:] = X_append
+        #         self.X.flush()
 
-            self.Y = self._create_or_extend_memmap(self.Y_mapfile,np.float32,Y_append.shape)
-            self.Y[-Y_append.shape[0]:] = Y_append
-            self.Y.flush()
+        #         self.Y = self._create_or_extend_memmap(self.Y_mapfile,np.float32,Y_append.shape)
+        #         self.Y[-Y_append.shape[0]:] = Y_append
+        #         self.Y.flush()
 
-            _logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
-            # _logger.debug(self.X.shape)
-            # _logger.debug(self.Y.shape)
+        #         # logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
+        #         # logger.debug(self.X.shape)
+        #         # logger.debug(self.Y.shape)
+        #         pbar.update(1)
 
-        del X_append
-        del Y_append
-        del kb_block
-        del ms_block
-        del raw_frames
-        del flow_frames
-        self.release_clip()
-        # _logger.debug(f"{len(self.X)}")
-        # _logger.debug(f"{len(self.Y)}")
+        # del X_append
+        # del Y_append
+        # del kb_block
+        # del ms_block
+        # del raw_frames
+        # del flow_frames
+        # self.release_clip()
+        # logger.debug(f"{len(self.X)}")
+        # logger.debug(f"{len(self.Y)}")
     
-        self.info["X_shape"] = [self.BLOCK_COUNT,self.BLOCK_SIZE,*self.X.shape[1:]]
-        self.info["Y_shape"] = [self.BLOCK_COUNT,self.BLOCK_SIZE,*self.Y.shape[1:]]
+        self.info["X_shape"] = self.X.shape
+        self.info["Y_shape"] = self.Y.shape
 
-        # _logger.debug(self.info)
+        logger.debug(self.info)
 
-        with open(self.info_file,mode="w",encoding="utf-8") as fp:
-            json.dump(self.info,fp)
+        # with open(self.info_file,mode="w",encoding="utf-8") as fp:
+        #     json.dump(self.info,fp)
 
 
 # class Genshin_Basic_Control_Dataset(Dataset):
@@ -661,8 +807,8 @@ class Control_Record():
 #             # 将 existing_memmap reshape 为正确的形状
 #             existing_memmap = existing_memmap.reshape((num_frames,) + shape[1:])
 
-#             # _logger.debug(existing_memmap.shape)
-#             # _logger.debug(shape)
+#             # logger.debug(existing_memmap.shape)
+#             # logger.debug(shape)
 #             new_shape = (existing_memmap.shape[0] + shape[0],) + existing_memmap.shape[1:]
 #             memmap = np.memmap(file_path, dtype=dtype, mode=mode, shape=new_shape)
 #         else:
@@ -681,7 +827,7 @@ class Control_Record():
 #         将类中的records转化为可供使用的数据集
 #         """
 #         if(os.path.exists(self.X_mapfile) and os.path.exists(self.Y_mapfile)):
-#             _logger.info(f"{repr(self)}: 数据集已存在，直接读取")
+#             logger.info(f"{repr(self)}: 数据集已存在，直接读取")
 #             self._load_memmap_fp()
 #             return
         
@@ -703,8 +849,8 @@ class Control_Record():
 #                 X_append = np.concatenate([raw_frames, flow_frames], axis=-1)
 #                 Y_append = np.concatenate([kb_block, ms_block], axis=-1)
 
-#                 # _logger.debug(X_append.shape)
-#                 # _logger.debug(Y_append.shape)
+#                 # logger.debug(X_append.shape)
+#                 # logger.debug(Y_append.shape)
 
 #                 self.X = self._create_or_extend_memmap(self.X_mapfile,np.uint8,X_append.shape)
 #                 self.X[-X_append.shape[0]:] = X_append
@@ -714,9 +860,9 @@ class Control_Record():
 #                 self.Y[-Y_append.shape[0]:] = Y_append
 #                 self.Y.flush()
 
-#                 _logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
-#                 # _logger.debug(self.X.shape)
-#                 # _logger.debug(self.Y.shape)
+#                 logger.debug(f"{repr(self)}: 进度 {self.X.shape[0]}")
+#                 # logger.debug(self.X.shape)
+#                 # logger.debug(self.Y.shape)
 
 #             del X_append
 #             del Y_append
@@ -725,8 +871,8 @@ class Control_Record():
 #             del raw_frames
 #             del flow_frames
 #             record_obj.release_clip()
-#             # _logger.debug(f"{len(self.X)}")
-#             # _logger.debug(f"{len(self.Y)}")
+#             # logger.debug(f"{len(self.X)}")
+#             # logger.debug(f"{len(self.Y)}")
         
 #         process_info["X_shape"] = list(self.X.shape)
 #         process_info["Y_shape"] = list(self.Y.shape)
@@ -752,22 +898,22 @@ def process_raw_csv(path:str,record:str,**kwargs):
 
     try:
         csv_fp = open(os.path.join(path,f"{record}.csv"),mode='r',encoding="utf-8")
-        _logger.info(f"正在处理 {record}")
+        logger.info(f"正在处理 {record}")
     except:
-        _logger.exception("csv文件不存在")
+        logger.exception("csv文件不存在")
         exit(-1)
 
     # 虽然这里是 .kb与.ms文件,但实际存储格式依然为csv
     try:
         kb_fp = open(os.path.join(path,f"{record}.kb"),mode="w",encoding="utf-8")
     except:
-        _logger.exception(f"{record}.kb 写入失败")
+        logger.exception(f"{record}.kb 写入失败")
         exit(-1)
 
     try:
         ms_fp = open(os.path.join(path,f"{record}.ms"),mode="w",encoding="utf-8")
     except:
-        _logger.exception(f"{record}.ms 写入失败")
+        logger.exception(f"{record}.ms 写入失败")
         exit(-1)
 
     # 读取按键映射表
@@ -776,7 +922,7 @@ def process_raw_csv(path:str,record:str,**kwargs):
         with open(key_map_file,mode='r',encoding="utf-8") as json_fp:
             key_map = json.load(json_fp)
     except:
-        _logger.exception(f"无法读取按键映射表")
+        logger.exception(f"无法读取按键映射表")
         exit(-1)
 
 
@@ -803,13 +949,13 @@ def process_raw_csv(path:str,record:str,**kwargs):
             # 非法数据
             continue
     
-    _logger.info(f"分离完成 {record}.csv")
+    logger.info(f"分离完成 {record}.csv")
     ms_fp.close()
     kb_fp.close()
     csv_fp.close()
 
     with open(os.path.join(path,"records.txt"),mode='a',encoding="utf-8") as fp:
-        _logger.info(f"已导出 {record}")
+        logger.info(f"已导出 {record}")
         fp.write(record)
         fp.write('\n')
 
@@ -853,19 +999,20 @@ def clip_compression_moviepy(path:str,record:str,**kwargs):
         new_height = kwargs["height"]
     else:
         # RAFT光流需要8的倍数,所以是272
-        new_height = 272
+        new_height = Dataset_Config.default_s_height
     
     if("width" in kwargs):
         new_width = kwargs["width"]
     else:
-        new_width = 480
+        new_width = Dataset_Config.default_s_width
 
-    input_video = f"{record}.mp4"
-    output_video = f"{record}_s.mp4"
+    video_info = Record_Info(path,record)
+    input_video = f"{record}.{Dataset_Config.video_suffix}"
+    output_video = f"{record}_s.{Dataset_Config.video_suffix}"
 
     # 如果压制视频已存在, 则不作任何更改
     if(os.path.exists(os.path.join(path,output_video))):
-        _logger.info(f"已存在 {output_video}")
+        logger.info(f"已存在 {output_video}")
         return
 
     # 加载视频
@@ -876,8 +1023,8 @@ def clip_compression_moviepy(path:str,record:str,**kwargs):
     original_fps = video.fps
     original_width, original_height = video.size
 
-    _logger.info(f"正在压制 {input_video}")
-    _logger.info(f"目标大小: {new_width}*{new_height}")
+    logger.info(f"正在压制 {input_video}")
+    logger.info(f"目标大小: {new_width}*{new_height}")
 
 
     # 调整分辨率
@@ -886,37 +1033,45 @@ def clip_compression_moviepy(path:str,record:str,**kwargs):
     # 保存调整后的视频
     resized_video.write_videofile(os.path.join(path,output_video))
 
-    _logger.info(f"压制完成 {output_video}")
+    logger.info(f"压制完成 {output_video}")
 
     # 关闭视频对象
     video.close()
     resized_video.close()
 
     # 存储原始属性
-    if (os.path.exists(os.path.join(path,f"{record}_info.json"))):
-        with open(os.path.join(path,f"{record}_info.json"),mode='r',encoding="utf-8") as fp:
-            video_info = json.load(fp)
-        video_info["original_fps"] = original_fps
-        video_info["original_width"] = original_width
-        video_info["original_height"] = original_height
-        video_info["total_frames"] = total_frames
-        video_info["flag_raw"] = True
-        video_info["flag_raw_S"] = True
-        with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
-            json.dump(video_info,fp)
-        _logger.info(f"视频信息已存储 {input_video}")
+    video_info["original_fps"] = original_fps
+    video_info["original_width"] = original_width
+    video_info["original_height"] = original_height
+    video_info["total_frames"] = total_frames
+    video_info["flag_raw"] = True
+    video_info["flag_raw_S"] = True
+    logger.info(f"视频信息已存储 {input_video}")
 
-    else:
-        with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
-            video_info = dict()
-            video_info["original_fps"] = original_fps
-            video_info["original_width"] = original_width
-            video_info["original_height"] = original_height
-            video_info["total_frames"] = total_frames
-            video_info["flag_raw"] = True
-            video_info["flag_raw_S"] = True
-            json.dump(video_info,fp)
-            _logger.info(f"视频信息已存储 {input_video}")
+    # if (os.path.exists(os.path.join(path,f"{record}_info.json"))):
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='r',encoding="utf-8") as fp:
+    #         video_info = json.load(fp)
+    #     video_info["original_fps"] = original_fps
+    #     video_info["original_width"] = original_width
+    #     video_info["original_height"] = original_height
+    #     video_info["total_frames"] = total_frames
+    #     video_info["flag_raw"] = True
+    #     video_info["flag_raw_S"] = True
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+    #         json.dump(video_info,fp)
+    #     logger.info(f"视频信息已存储 {input_video}")
+
+    # else:
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+    #         video_info = dict()
+    #         video_info["original_fps"] = original_fps
+    #         video_info["original_width"] = original_width
+    #         video_info["original_height"] = original_height
+    #         video_info["total_frames"] = total_frames
+    #         video_info["flag_raw"] = True
+    #         video_info["flag_raw_S"] = True
+    #         json.dump(video_info,fp)
+    #         logger.info(f"视频信息已存储 {input_video}")
 
 
 # OpenCV版本的视频压制代码
@@ -933,22 +1088,23 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     if("height" in kwargs):
         new_height = kwargs["height"]
     else:
-        new_height = 272
+        new_height = Dataset_Config.default_s_height
     
     if("width" in kwargs):
         new_width = kwargs["width"]
     else:
-        new_width = 480
+        new_width = Dataset_Config.default_s_width
 
-    input_video = f"{record}.mp4"
-    output_video = f"{record}_s.mp4"
+    video_info = Record_Info(path,record)
+    input_video = f"{record}.{Dataset_Config.video_suffix}"
+    output_video = f"{record}_s.{Dataset_Config.video_suffix}"
     input_video_path = os.path.join(path,input_video)
     output_video_path = os.path.join(path,output_video)
 
     # 如果压制视频已存在, 则不作任何更改
     calc = True
     if(os.path.exists(os.path.join(path,output_video))):
-        _logger.info(f"已存在 {output_video}")
+        logger.info(f"已存在 {output_video}")
         calc = False
     
     # 检查OpenCV是否支持CUDA
@@ -959,7 +1115,7 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     # 打开输入视频
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
-        _logger.exception(f"无法打开视频 {input_video_path}")
+        logger.exception(f"无法打开视频 {input_video_path}")
         return
 
     # 获取视频的原始属性
@@ -970,68 +1126,80 @@ def clip_compression_opencv(path:str,record:str,**kwargs):
     
     if(calc):
         # 设置输出视频的编码器和属性
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 使用MP4编码器
+        fourcc = cv2.VideoWriter_fourcc(*Dataset_Config.video_enc)  # 使用MP4编码器
         out = cv2.VideoWriter(output_video_path, fourcc, original_fps, (new_width, new_height))
 
         # 创建CUDA加速的帧处理管道
         cuda_stream = cv2.cuda_Stream()  # 创建CUDA流
         # cuda_resizer = cv2.cuda_Resize(new_width, new_height)  # 创建CUDA缩放器
 
-        _logger.info(f"正在压制 {input_video}")
-        _logger.info(f"目标大小: {new_width}*{new_height}")
+        logger.info(f"正在压制 {input_video}")
+        logger.info(f"目标大小: {new_width}*{new_height}")
 
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break  # 视频结束
+        with tqdm(total=total_frames, desc="视频压制") as pbar:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break  # 视频结束
 
-            # 将帧上传到GPU
-            gpu_frame = cv2.cuda_GpuMat()
-            gpu_frame.upload(frame, stream=cuda_stream)
+                # 将帧上传到GPU
+                gpu_frame = cv2.cuda_GpuMat()
+                gpu_frame.upload(frame, stream=cuda_stream)
 
-            # 使用CUDA进行缩放
-            # resized_gpu_frame = cuda_resizer.apply(gpu_frame, stream=cuda_stream)
-            resized_gpu_frame = cv2.cuda.resize(gpu_frame, (new_width, new_height), stream=cuda_stream)
+                # 使用CUDA进行缩放
+                # resized_gpu_frame = cuda_resizer.apply(gpu_frame, stream=cuda_stream)
+                resized_gpu_frame = cv2.cuda.resize(gpu_frame, (new_width, new_height), stream=cuda_stream)
 
-            # 将缩放后的帧下载回CPU
-            resized_frame = resized_gpu_frame.download(stream=cuda_stream)
+                # 将缩放后的帧下载回CPU
+                resized_frame = resized_gpu_frame.download(stream=cuda_stream)
 
-            # 写入输出视频
-            out.write(resized_frame)
+                # 写入输出视频
+                out.write(resized_frame)
+                pbar.update(1)
 
         # 释放资源
         cap.release()
         out.release()
-        _logger.info(f"压制完成 {output_video}")
+        logger.info(f"压制完成 {output_video}")
 
     # 存储原始属性
-    if (os.path.exists(os.path.join(path,f"{record}_info.json"))):
-        with open(os.path.join(path,f"{record}_info.json"),mode='r',encoding="utf-8") as fp:
-            video_info = json.load(fp)
-        with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
-            video_info["original_fps"] = original_fps
-            video_info["original_width"] = original_width
-            video_info["original_height"] = original_height
-            video_info["s_width"] = new_width
-            video_info["s_height"] = new_height
-            video_info["total_frames"] = total_frames
-            video_info["flag_raw"] = True
-            video_info["flag_raw_S"] = True
-            json.dump(video_info,fp)
-            _logger.info(f"视频信息已存储 {input_video}")
-    else:
-        with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
-            video_info = dict()
-            video_info["original_fps"] = original_fps
-            video_info["original_width"] = original_width
-            video_info["original_height"] = original_height
-            video_info["s_width"] = new_width
-            video_info["s_height"] = new_height
-            video_info["total_frames"] = total_frames
-            video_info["flag_raw"] = True
-            video_info["flag_raw_S"] = True
-            json.dump(video_info,fp)
-            _logger.info(f"视频信息已存储 {input_video}")
+    video_info["original_fps"] = original_fps
+    video_info["original_width"] = original_width
+    video_info["original_height"] = original_height
+    video_info["s_width"] = new_width
+    video_info["s_height"] = new_height
+    video_info["total_frames"] = total_frames
+    video_info["flag_raw"] = True
+    video_info["flag_raw_S"] = True
+    logger.info(f"视频信息已存储 {input_video}")
+
+    # if (os.path.exists(os.path.join(path,f"{record}_info.json"))):
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='r',encoding="utf-8") as fp:
+    #         video_info = json.load(fp)
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+    #         video_info["original_fps"] = original_fps
+    #         video_info["original_width"] = original_width
+    #         video_info["original_height"] = original_height
+    #         video_info["s_width"] = new_width
+    #         video_info["s_height"] = new_height
+    #         video_info["total_frames"] = total_frames
+    #         video_info["flag_raw"] = True
+    #         video_info["flag_raw_S"] = True
+    #         json.dump(video_info,fp)
+    #         logger.info(f"视频信息已存储 {input_video}")
+    # else:
+    #     with open(os.path.join(path,f"{record}_info.json"),mode='w',encoding="utf-8") as fp:
+    #         video_info = dict()
+    #         video_info["original_fps"] = original_fps
+    #         video_info["original_width"] = original_width
+    #         video_info["original_height"] = original_height
+    #         video_info["s_width"] = new_width
+    #         video_info["s_height"] = new_height
+    #         video_info["total_frames"] = total_frames
+    #         video_info["flag_raw"] = True
+    #         video_info["flag_raw_S"] = True
+    #         json.dump(video_info,fp)
+    #         logger.info(f"视频信息已存储 {input_video}")
 
 def choose_clip_compression(path:str,record:str,**kwargs):
     # 检查OpenCV是否支持CUDA
@@ -1046,38 +1214,40 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
     光流计算, 使用OpenCV
     '''
     if not cv2.cuda.getCudaEnabledDeviceCount():
-        _logger.warning("CUDA 不可用，使用CPU计算")
+        logger.warning("CUDA 不可用，使用CPU计算")
         cuda_available = False
     else:
-        _logger.info("使用CUDA计算")
+        logger.info("使用CUDA计算")
         cuda_available = True
 
     if use_large:
-        _logger.warning("警告: 正在使用原视频计算光流")
-        input_video = f"{record}.mp4"
-        output_video = f"{record}_flow.mp4"
+        logger.warning("警告: 正在使用原视频计算光流")
+        input_video = f"{record}.{Dataset_Config.video_suffix}"
+        output_video = f"{record}_flow.{Dataset_Config.flow_video_suffix}"
     else:
-        input_video = f"{record}_s.mp4"
-        output_video = f"{record}_s_flow.mp4"
+        input_video = f"{record}_s.{Dataset_Config.video_suffix}"
+        output_video = f"{record}_s_flow.{Dataset_Config.flow_video_suffix}"
 
     # 打开视频文件
     cap = cv2.VideoCapture(os.path.join(record_dir,input_video))
     if not cap.isOpened():
-        _logger.exception(f"无法打开视频文件 {input_video}")
+        logger.exception(f"无法打开视频文件 {input_video}")
         return
 
     # 获取视频的宽度、高度和帧率
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     calc = True
     if(os.path.exists(os.path.join(record_dir,output_video))):
-        _logger.info(f"光流视频已存在，不进行计算 {output_video}")
+        logger.info(f"光流视频已存在，不进行计算 {output_video}")
         calc = False
     else:
         # 创建视频写入对象
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 视频编码格式
+        fourcc = cv2.VideoWriter_fourcc(*Dataset_Config.flow_video_enc)  # 视频编码格式
+        # fourcc = cv2.VideoWriter_fourcc(*'IYUV')
         out = cv2.VideoWriter(os.path.join(record_dir,output_video), fourcc, fps, (width, height))
 
     if cuda_available and calc:
@@ -1107,54 +1277,57 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         _i = 0
 
         # 处理每一帧
-        while True:
-            ret, curr_frame = cap.read()
-            if not ret:
-                break
+        with tqdm(total=total_frames, desc="CUDA光流计算") as pbar:
+            while True:
+                ret, curr_frame = cap.read()
+                if not ret:
+                    break
 
-            # 将当前帧转换为灰度图并上传到 GPU
-            curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
-            curr_gpu = cv2.cuda_GpuMat()
-            curr_gpu.upload(curr_gray)
+                # 将当前帧转换为灰度图并上传到 GPU
+                curr_gray = cv2.cvtColor(curr_frame, cv2.COLOR_BGR2GRAY)
+                curr_gpu = cv2.cuda_GpuMat()
+                curr_gpu.upload(curr_gray)
 
-            # 使用 CUDA 计算光流
-            flow_gpu = cuda_farneback.calc(prev_gpu, curr_gpu, None)
+                # 使用 CUDA 计算光流
+                flow_gpu = cuda_farneback.calc(prev_gpu, curr_gpu, None)
 
-            # 将光流下载到 CPU
-            flow = flow_gpu.download()
+                # 将光流下载到 CPU
+                flow = flow_gpu.download()
 
-            # 将光流转换为极坐标（幅度和角度）
-            magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                # 将光流转换为极坐标（幅度和角度）
+                magnitude, angle = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-            # 将光流可视化
-            hsv = np.zeros((height, width, 3), dtype=np.uint8)
-            hsv[..., 0] = angle * 180 / np.pi / 2  # 色调
-            hsv[..., 1] = 255                      # 饱和度
-            hsv[..., 2] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)  # 亮度
-            flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+                # 将光流可视化
+                hsv = np.zeros((height, width, 3), dtype=np.uint8)
+                hsv[..., 0] = angle * 180 / np.pi / 2  # 色调
+                hsv[..., 1] = 255                      # 饱和度
+                hsv[..., 2] = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX)  # 亮度
+                flow_img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-            # 将光流图像写入视频
-            out.write(flow_img)
+                # 将光流图像写入视频
+                out.write(flow_img)
 
-            # 更新前一帧
-            prev_gpu = curr_gpu
+                # 更新前一帧
+                prev_gpu = curr_gpu
 
-            _i-=-1
-            if(_i % 1000 == 0):
-                _logger.info(f"正在处理第 {_i} 帧")
+                _i-=-1
+                # if(_i % 1000 == 0):
+                #     logger.info(f"正在处理第 {_i} 帧")
+
+                pbar.update(1)
 
         # 释放资源
         cap.release()
         out.release()
         cv2.destroyAllWindows()
 
-        _logger.info(f"光流视频已保存到: {os.path.join(record_dir,input_video)}")
+        logger.info(f"光流视频已保存到: {os.path.join(record_dir,input_video)}")
 
     elif calc:
         # 读取第一帧并转换为灰度图像
         ret, old_frame = cap.read()
         if not ret:
-            _logger.info("视频为空")
+            logger.info("视频为空")
             return
 
         old_gray = cv2.cvtColor(old_frame, cv2.COLOR_BGR2GRAY)
@@ -1163,55 +1336,64 @@ def calculate_optical_flow(record_dir:str,record:str,use_large:bool=False,**kwar
         hsv = np.zeros_like(old_frame)
         hsv[..., 1] = 255  # 饱和度设为最大
 
-        _logger.info(f"正在绘制光流图...")
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        logger.info(f"正在绘制光流图...")
+        with tqdm(total=total_frames, desc="CPU光流计算") as pbar:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # 转换为灰度图像
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                # 转换为灰度图像
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # 计算光流
-            flow = cv2.calcOpticalFlowFarneback(old_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+                # 计算光流
+                flow = cv2.calcOpticalFlowFarneback(old_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
 
-            # 计算光流的幅度和角度
-            mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+                # 计算光流的幅度和角度
+                mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
 
-            # 将角度和幅度映射到HSV颜色空间
-            hsv[..., 0] = ang * 180 / np.pi / 2  # 色相
-            hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)  # 明度
+                # 将角度和幅度映射到HSV颜色空间
+                hsv[..., 0] = ang * 180 / np.pi / 2  # 色相
+                hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX)  # 明度
 
-            # 转换为BGR颜色空间
-            bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+                # 转换为BGR颜色空间
+                bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-            # 写入光流图到视频文件
-            out.write(bgr)
+                # 写入光流图到视频文件
+                out.write(bgr)
 
-            # 显示原始帧和光流图
-            # cv2.imshow('Original Frame', frame)
-            # cv2.imshow('Optical Flow', bgr)
+                # 显示原始帧和光流图
+                # cv2.imshow('Original Frame', frame)
+                # cv2.imshow('Optical Flow', bgr)
 
-            # 更新旧帧
-            old_gray = gray.copy()
+                # 更新旧帧
+                old_gray = gray.copy()
 
-            if cv2.waitKey(30) & 0xFF == 27:  # 按Esc键退出
-                break
+                if cv2.waitKey(30) & 0xFF == 27:  # 按Esc键退出
+                    break
+                pbar.update(1)
 
-        _logger.info(f"光流视频已保存到: {os.path.join(record_dir,input_video)}")
+        logger.info(f"光流视频已保存到: {os.path.join(record_dir,input_video)}")
         cap.release()
         out.release()
         cv2.destroyAllWindows()
 
-    with open(os.path.join(record_dir,f"{record}_info.json"),mode="r",encoding="utf-8") as fp:
-        info = json.load(fp)
-    with open(os.path.join(record_dir,f"{record}_info.json"),mode="w",encoding="utf-8") as fp:
-        if(use_large):
-            info["flag_flow"] = True
-        else:
-            info["flag_flow_S"] = True
-        json.dump(info,fp)
-        _logger.info(f"视频信息已存储 {input_video}")
+    video_info = Record_Info(record_dir,record)
+    if(use_large):
+        video_info["flag_flow"] = True
+    else:
+        video_info["flag_flow_S"] = True
+    logger.info(f"视频信息已存储 {input_video}")
+
+    # with open(os.path.join(record_dir,f"{record}_info.json"),mode="r",encoding="utf-8") as fp:
+    #     info = json.load(fp)
+    # with open(os.path.join(record_dir,f"{record}_info.json"),mode="w",encoding="utf-8") as fp:
+    #     if(use_large):
+    #         info["flag_flow"] = True
+    #     else:
+    #         info["flag_flow_S"] = True
+    #     json.dump(info,fp)
+    #     logger.info(f"视频信息已存储 {input_video}")
 
 # 加载 RAFT 模型
 def load_raft_model(args):
@@ -1223,7 +1405,7 @@ def load_raft_model(args):
     return model
 
 @timer_logger
-def calculate_opticcal_flow_torch(record_dir:str,record:str):
+def calculate_optical_flow_torch(record_dir:str,record:str):
     '''
     使用RAFT计算视频光流(不推荐)
     '''
@@ -1238,8 +1420,8 @@ def calculate_opticcal_flow_torch(record_dir:str,record:str):
     )
     model = load_raft_model(args)
 
-    input_video = f"{record}_s.mp4"
-    output_video = f"{record}_s_flow_torch.mp4"
+    input_video = f"{record}_s.{Dataset_Config.video_suffix}"
+    output_video = f"{record}_s_flow_torch.{Dataset_Config.video_suffix}"
 
     # 读取视频
     video_path = os.path.join(record_dir,input_video)
@@ -1252,7 +1434,7 @@ def calculate_opticcal_flow_torch(record_dir:str,record:str):
 
     # 创建 VideoWriter 对象
     output_path = os.path.join(record_dir,output_video)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 视频编码格式
+    fourcc = cv2.VideoWriter_fourcc(*Dataset_Config.flow_video_enc)  # 视频编码格式
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     # 读取第一帧
@@ -1294,7 +1476,7 @@ def calculate_opticcal_flow_torch(record_dir:str,record:str):
     out.release()
     cv2.destroyAllWindows()
 
-    _logger.info(f"光流视频已保存到: {output_path}")
+    logger.info(f"光流视频已保存到: {output_path}")
 
 
 def transfer_capture_dir(dir:str):
@@ -1358,5 +1540,5 @@ def Make_Dataset(full_dataset,train_rate=0.8,val_rate=0.1):
 
 if __name__ == "__main__":
 
-    transfer_capture_dir("G:\\NN_train\\record_all_0319")
+    transfer_capture_dir("G:\\NN_train\\debug")
     pass

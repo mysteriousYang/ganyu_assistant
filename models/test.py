@@ -7,10 +7,12 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 import os
 
-from model import CustomModel
-from train import validate
+from models.model_design0 import CustomModel
+from models.train import validate
 from dataset import Make_Dataset
 from dataloader import Make_Dataloader
+
+# 这个文件暂时还没用，不管它
 
 # 设备配置
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
